@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backup-hard"
+version = "0.1.0"
+description = "Staged, resumable, verified filesystem backups"
+requires-python = ">=3.9"
+readme = "README.md"
+license = {text = "Proprietary"}
+authors = [{name = "Backup Hard contributors"}]
+keywords = ["backup", "filesystem", "verification"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+backup-inventory = "backup_hard.inventory:main"
+backup-select-formats = "backup_hard.select_formats:main"
+backup-copy = "backup_hard.copy_backup:main"
+backup-verify = "backup_hard.verify_backup:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
