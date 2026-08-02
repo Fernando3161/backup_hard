@@ -13,6 +13,10 @@ dist/
 htmlcov/
 reports/
 backup_*/
+!src/backup_hard/
+!src/backup_hard/*.py
+*_????????/
+android-devices.local.json
 examples/example-output/
 docs/_build/
 site/
