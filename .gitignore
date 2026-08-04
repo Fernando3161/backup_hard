@@ -18,6 +18,8 @@ htmlcov/
 /examples/example-output/
 /prompt1.md
 /final_clear_prompt.md
+/AGENTS.md
+/BACKUP_HARD_PRODUCTION_REFACTORING_PLAN.md
 docs/_build/
 site/
 .ipynb_checkpoints/
