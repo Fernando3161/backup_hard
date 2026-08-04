@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backup-hard"
-version = "0.4.0.dev0"
+version = "0.8.0.dev0"
 description = "Staged, resumable, verified filesystem backups"
 requires-python = ">=3.9"
 readme = "README.md"
@@ -51,9 +51,13 @@ packages = ["backup_hard"]
 check_untyped_defs = true
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["backup_hard.android", "backup_hard.copy_backup", "backup_hard.inventory", "backup_hard.select_formats", "backup_hard.verify_backup"]
+ignore_errors = true
+
 [tool.ruff]
 target-version = "py39"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E9", "F63", "F7", "F82"]

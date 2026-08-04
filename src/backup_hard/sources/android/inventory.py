@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, cast
 
 from backup_hard.models import SourceFile, SourceVolume
 from backup_hard.sources.android.adb import AdbRunner
@@ -44,7 +44,7 @@ def inventory_volume(runner: AdbRunner, serial: str, volume: SourceVolume) -> tu
     process = runner.open_shell(serial, ["sh", "-c", BATCH_SCRIPT, "backup-hard", volume.root])
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("ADB inventory pipes are unavailable")
-    fields = iter(_nul_fields(process.stdout))
+    fields = iter(_nul_fields(cast(BinaryIO, process.stdout)))
     files: list[SourceFile] = []
     errors: list[str] = []
     try:

@@ -37,9 +37,10 @@ def select_device(runner: AdbRunner, serial: str | None) -> ConnectedDevice:
             raise AdbError("Pass --device-serial when multiple or no ready devices are present")
         selected = ready[0]
     else:
-        selected = next((device for device in devices if device.serial == serial), None)
-        if selected is None:
+        requested = next((device for device in devices if device.serial == serial), None)
+        if requested is None:
             raise AdbError("Requested Android device is disconnected")
+        selected = requested
     if selected.state == "unauthorized":
         raise AdbError("Device is unauthorized; accept the USB debugging prompt")
     if selected.state == "offline":

@@ -59,7 +59,8 @@ def select_archive_date(file: SourceFile) -> tuple[int | None, str, str]:
     match = FILENAME_DATE.search(file.filename)
     if match:
         try:
-            value = datetime(*(int(part) for part in match.groups()), tzinfo=timezone.utc)
+            year, month, day = (int(part) for part in match.groups())
+            value = datetime(year, month, day, tzinfo=timezone.utc)
             return int(value.timestamp()), value.strftime("%Y_%m"), "filename"
         except ValueError:
             pass

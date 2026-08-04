@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Iterable, cast
 
 from backup_hard.models import SourceFile, SourceIdentity, SourceVolume
 from backup_hard.sources.android.adb import AdbRunner
@@ -43,4 +43,4 @@ class AndroidAdbSource:
         process = self.runner.open_exec_out(self.device.serial, ["cat", "--", file.source_path])
         if process.stdout is None:
             raise RuntimeError("ADB stream has no stdout pipe")
-        return process.stdout
+        return cast(BinaryIO, process.stdout)
