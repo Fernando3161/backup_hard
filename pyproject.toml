@@ -22,6 +22,9 @@ Homepage = "https://github.com/Fernando3161/backup_hard"
 Repository = "https://github.com/Fernando3161/backup_hard"
 Issues = "https://github.com/Fernando3161/backup_hard/issues"
 
+[project.optional-dependencies]
+dev = ["build>=1", "mypy>=1.8", "pytest>=7", "pytest-cov>=4", "ruff>=0.5"]
+
 [project.scripts]
 backup-hard = "backup_hard.cli:main"
 backup-inventory = "backup_hard.cli:inventory_main"
@@ -34,3 +37,23 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["backup_hard"]
+
+[tool.mypy]
+python_version = "3.9"
+packages = ["backup_hard"]
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
