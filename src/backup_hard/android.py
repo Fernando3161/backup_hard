@@ -5,19 +5,40 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-import os
 import re
 import shlex
-import shutil
+import sqlite3
 import subprocess
-import uuid
+import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterable, Sequence
 
 from backup_hard.backup_run import step_directory, validate_backup_id
+from backup_hard.destination import RunMarker, initialize_destination, require_owned_destination
+from backup_hard.engine.copying import (
+    DestinationConflict,
+    cleanup_owned_partials,
+    copy_and_record,
+    remaining_bytes,
+    require_free_space,
+)
+from backup_hard.engine.planning import PlanningItem, plan_destinations
+from backup_hard.manifest import Manifest
+from backup_hard.models import (
+    CopyResult,
+    CopyStatus,
+    FileCategory,
+    SourceFile,
+    SourceIdentity,
+    SourceVolume,
+)
+from backup_hard.policies.android_media_documents import AndroidMediaDocumentsPolicy
+from backup_hard.policies.base import PolicyContext
+from backup_hard.sources.android.inventory import inventory_source
 
 
 MEDIA_EXTENSIONS = {
@@ -51,7 +72,9 @@ INVENTORY_FIELDS = [
 PLAN_FIELDS = [
     "serial", "device_label", "volume", "source_root", "source_path", "relative_path",
     "destination_relative_path", "filename", "extension", "category", "size_bytes", "mtime",
-    "media_bucket", "collision_index", "collision_reason",
+    "origin", "media_type", "package_name", "origin_rule", "archive_timestamp",
+    "archive_month", "date_source", "destination_group", "position", "part_number",
+    "encoded_filename", "media_bucket", "collision_index", "collision_reason",
 ]
 SOCIAL_MEDIA_MARKERS = {
     "whatsapp", "whassap", "facebook", "instagram", "twitter", "telegram",
@@ -121,6 +144,63 @@ class Adb:
 
     def stream(self, serial: str, source: str) -> bytes:
         return self.run(["-s", serial, "exec-out", "cat", "--", source], binary=True).stdout
+
+    def open_stream(self, serial: str, source: str) -> "AdbStream":
+        command = " ".join(shlex.quote(arg) for arg in ("cat", "--", source))
+        try:
+            process = subprocess.Popen(
+                [self.executable, "-s", serial, "exec-out", command],
+                shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AndroidError("adb was not found. Install Android SDK Platform Tools and add adb to PATH.") from exc
+        return AdbStream(process)
+
+    def open_shell(self, serial: str, arguments: Sequence[str]) -> subprocess.Popen[bytes]:
+        command = " ".join(shlex.quote(argument) for argument in arguments)
+        try:
+            return subprocess.Popen(
+                [self.executable, "-s", serial, "shell", command], shell=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AndroidError("adb was not found. Install Android SDK Platform Tools and add adb to PATH.") from exc
+
+
+class AdbStream:
+    """Bounded ADB stdout reader that reports transport failure at EOF."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            raise AndroidError("ADB stream pipes are unavailable")
+        self.process = process
+        self.stdout = process.stdout
+        self.stderr = process.stderr
+        self.checked = False
+
+    def read(self, size: int = -1) -> bytes:
+        block = self.stdout.read(size)
+        if not block and not self.checked:
+            self.checked = True
+            returncode = self.process.wait()
+            detail = self.stderr.read().decode("utf-8", errors="replace").strip()
+            if returncode:
+                raise AndroidError(detail or f"ADB stream exited with status {returncode}")
+        return block
+
+    def close(self) -> None:
+        self.stdout.close()
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait()
+        self.stderr.close()
+
+    def __enter__(self) -> "AdbStream":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def select_device(adb: Adb, serial: str | None) -> Device:
@@ -222,33 +302,30 @@ def inventory_device(adb: Adb, serial: str | None, label: str) -> tuple[dict[str
     volumes, errors = discover_volumes(adb, serial)
     manufacturer = _prop(adb, serial, "ro.product.manufacturer")
     model = _prop(adb, serial, "ro.product.model")
+    fingerprint = _prop(adb, serial, "ro.build.fingerprint")
     rows: list[dict[str, object]] = []
-    for volume in volumes:
-        try:
-            paths = _list_paths(adb, serial, volume.root)
-        except AndroidError as exc:
-            errors.append({"path": volume.root, "operation": "scan volume", "error": str(exc)})
-            continue
-        for source_path in sorted(paths, key=str.casefold):
-            relative = source_path[len(volume.root):].lstrip("/")
-            extension = PurePosixPath(relative).suffix.casefold()
-            try:
-                size, mtime = _stat(adb, serial, source_path)
-                category = classify(extension)
-                reason = exclusion_reason(relative, extension, category, size)
-                status = "excluded" if reason else "included"
-            except (AndroidError, ValueError) as exc:
-                size, mtime, category, status, reason = 0, 0, classify(extension), "error", f"inspection failed: {exc}"
-                errors.append({"path": source_path, "operation": "stat file", "error": str(exc)})
-            rows.append({
-                "serial": serial, "device_label": label, "manufacturer": manufacturer, "model": model,
-                "volume": volume.label, "source_root": volume.root, "source_path": source_path,
-                "relative_path": relative, "filename": PurePosixPath(relative).name,
-                "extension": extension, "category": category or "unknown", "size_bytes": size,
-                "mtime": mtime, "status": status, "exclusion_reason": reason or "",
-            })
+    source_volumes = [SourceVolume(volume.identifier, volume.label, volume.root, volume.label != "internal")
+                      for volume in volumes]
+    files, batch_errors = inventory_source(adb, serial, source_volumes)
+    errors.extend({"path": "", "operation": "batched inventory", "error": detail}
+                  for detail in batch_errors)
+    roots = {volume.identifier: volume.root for volume in volumes}
+    labels = {volume.identifier: volume.label for volume in volumes}
+    for file in sorted(files, key=lambda value: (value.volume_id, value.source_path.casefold(), value.source_path)):
+        category = classify(file.extension)
+        reason = exclusion_reason(file.relative_path, file.extension, category, file.size_bytes)
+        rows.append({
+            "serial": serial, "device_label": label, "manufacturer": manufacturer, "model": model,
+            "volume": labels[file.volume_id], "source_root": roots[file.volume_id],
+            "source_path": file.source_path, "relative_path": file.relative_path,
+            "filename": file.filename, "extension": file.extension,
+            "category": category or "unknown", "size_bytes": file.size_bytes,
+            "mtime": file.mtime_ns // 1_000_000_000, "status": "excluded" if reason else "included",
+            "exclusion_reason": reason or "",
+        })
     metadata = {"schema_version": 1, "source_type": "android", "serial": serial, "device_label": label,
-                "manufacturer": manufacturer, "model": model, "volumes": [volume.__dict__ for volume in volumes]}
+                "manufacturer": manufacturer, "model": model, "build_fingerprint": fingerprint,
+                "volumes": [volume.__dict__ for volume in volumes]}
     return metadata, rows, errors
 
 
@@ -322,28 +399,39 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
     if (output / "android_plan.csv").exists() or (output / "android_policy.json").exists():
         raise AndroidError("Android Step 2 is already locked; use a new backup ID to change the plan.")
     metadata = json.loads((step1 / "device.json").read_text(encoding="utf-8"))
-    rows = [row for row in read_csv(step1 / "android_inventory.csv") if row["status"] == "included"]
-    used: dict[str, int] = Counter()
+    source_rows: dict[str, dict[str, str]] = {}
+    items: list[PlanningItem] = []
+    policy_engine = AndroidMediaDocumentsPolicy()
+    for row in read_csv(step1 / "android_inventory.csv"):
+        if row["status"] != "included":
+            continue
+        source = SourceFile(
+            row["volume"], row["source_path"], row["relative_path"], row["filename"],
+            row["extension"], int(row["size_bytes"]), int(row["mtime"]) * 1_000_000_000,
+        )
+        classification = policy_engine.classify(source, PolicyContext("android"))
+        if classification.included:
+            source_rows[source.source_path] = row
+            items.append(PlanningItem(source, classification))
+    mappings = {mapping.source_path: mapping for mapping in plan_destinations(items)}
     plan: list[dict[str, object]] = []
-    for row in sorted(rows, key=lambda value: (value["volume"].casefold(), value["relative_path"].casefold(), value["source_path"])):
-        if row["category"] == "document":
-            folder = row["extension"].lstrip(".") or "no_extension"
-            key = f"{folder}/{row['filename']}".casefold()
-            index = used[key]
-            used[key] += 1
-            destination = f"documents/{folder}/{_collision_name(row['filename'], index)}"
-            reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
-            media_bucket = ""
-        else:
-            media_bucket = android_media_bucket(row["relative_path"], row["category"])
-            key = f"{media_bucket}/{row['filename']}".casefold()
-            index = used[key]
-            used[key] += 1
-            destination = f"{media_bucket}/{_collision_name(row['filename'], index)}"
-            reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
-        plan.append({**row, "destination_relative_path": destination,
-                     "media_bucket": media_bucket, "collision_index": index,
-                     "collision_reason": reason})
+    for item in items:
+        row = source_rows[item.file.source_path]
+        classification = item.classification
+        mapping = mappings[item.file.source_path]
+        plan.append({
+            **row, "destination_relative_path": mapping.destination_path.as_posix(),
+            "origin": classification.origin, "media_type": classification.media_type,
+            "package_name": classification.package_name, "origin_rule": classification.origin_rule,
+            "archive_timestamp": classification.archive_timestamp if classification.archive_timestamp is not None else "",
+            "archive_month": classification.archive_month, "date_source": classification.date_source,
+            "destination_group": mapping.group_key, "position": mapping.position,
+            "part_number": mapping.part_number if mapping.part_number is not None else "",
+            "encoded_filename": mapping.encoded_filename, "media_bucket": str(mapping.destination_path.parent),
+            "collision_index": mapping.collision_index,
+            "collision_reason": "" if mapping.collision_index == 0 else "Windows-portable destination collision",
+        })
+    plan.sort(key=lambda row: (str(row["destination_relative_path"]).casefold(), str(row["source_path"])))
     output.mkdir(parents=True, exist_ok=False)
     _write_csv(output / "android_plan.csv", PLAN_FIELDS, plan)
     policy = {"schema_version": 3, "source_type": "android", "status": "locked", "backup_id": backup_id,
@@ -351,22 +439,22 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
               "document_extensions": sorted(DOCUMENT_EXTENSIONS), "global_minimum_bytes": GLOBAL_MINIMUM,
               "category_minimum_bytes": CATEGORY_MINIMUMS, "excluded_directory_names": sorted(EXCLUDED_DIRECTORY_NAMES),
               "excluded_path_prefixes": sorted(EXCLUDED_PATH_PREFIXES), "streaming_markers": sorted(STREAMING_MARKERS),
-              "media_layout": {
-                  "audio": ["media/audio"],
-                  "video": ["media/video/camera", "media/video/social_media", "media/video/other"],
-                  "photos": ["media/photos/camera", "media/photos/social_media", "media/photos/screenshots", "media/photos/other"],
-              },
-              "social_media_markers": sorted(SOCIAL_MEDIA_MARKERS),
+              "media_layout": "media/<origin>/<media-type>/<YYYY_MM>[/part_NNN]/<file>",
+              "max_media_files_per_directory": 100,
               "file_collision_strategy": "deterministic numeric suffix before extension",
+              "filename_encoding": "reversible Windows-safe percent encoding before collision numbering",
               "expected_file_count": len(plan), "expected_bytes": sum(int(row["size_bytes"]) for row in plan)}
     (output / "android_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "format_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "plan.json").write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "policy.sha256").write_text(Manifest.canonical_digest(policy) + "\n", encoding="ascii")
+    (output / "plan.sha256").write_text(Manifest.canonical_digest(plan) + "\n", encoding="ascii")
     _write_csv(output / "format_selection.csv", ["extension", "category", "minimum_size_bytes"], [
         {"extension": ext, "category": category, "minimum_size_bytes": max(GLOBAL_MINIMUM, CATEGORY_MINIMUMS[category])}
         for category, extensions in {**MEDIA_EXTENSIONS, "document": DOCUMENT_EXTENSIONS}.items() for ext in sorted(extensions)
     ])
     (output / "format_selection_report.md").write_text(
-        f"# Step 2 — Locked Android copy plan\n\n> Status: **LOCKED**\n\n- Files: **{len(plan):,}**\n- Bytes: **{policy['expected_bytes']:,}**\n- Media is flattened into the fixed audio, video, and photo category directories.\n- Duplicate filenames use deterministic numeric suffixes.\n- Documents remain flattened by extension.\n",
+        f"# Step 2 — Locked Android copy plan\n\n> Status: **LOCKED**\n\n- Files: **{len(plan):,}**\n- Bytes: **{policy['expected_bytes']:,}**\n- Media layout: `media/<origin>/<media-type>/<YYYY_MM>[/part_NNN]/<file>`.\n- Groups split only when they exceed 100 files.\n- Names are Windows-safe and collision assignments are deterministic.\n- Documents are grouped by normalized extension.\n",
         encoding="utf-8",
     )
     return plan
@@ -388,58 +476,178 @@ def sha256_source(adb: Adb, serial: str, path: str) -> str:
     return hashlib.sha256(adb.stream(serial, path)).hexdigest()
 
 
-def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path, retries: int) -> tuple[list[dict[str, object]], bool]:
+def _tool_version() -> str:
+    try:
+        return version("backup-hard")
+    except PackageNotFoundError:
+        return "development"
+
+
+def _source_identity(device: dict[str, object], serial: str) -> SourceIdentity:
+    return SourceIdentity(
+        "android", serial, str(device.get("device_label", "android")),
+        str(device.get("manufacturer", "")), str(device.get("model", "")),
+        str(device.get("build_fingerprint", "")),
+    )
+
+
+def _run_marker(backup_id: str, device: dict[str, object], policy: object,
+                plan: object) -> RunMarker:
+    source_digest = Manifest.canonical_digest(device)
+    return RunMarker(
+        backup_id, source_digest, Manifest.canonical_digest(policy),
+        Manifest.canonical_digest(plan),
+    )
+
+
+def _write_managed_metadata(metadata: Path, policy: object, plan: object,
+                            marker: RunMarker) -> None:
+    (metadata / "policy.json").write_text(
+        json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (metadata / "plan.json").write_text(
+        json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (metadata / "policy.sha256").write_text(marker.policy_sha256 + "\n", encoding="ascii")
+    (metadata / "plan.sha256").write_text(marker.plan_sha256 + "\n", encoding="ascii")
+
+
+def _assert_managed_metadata(metadata: Path, policy: object, plan: object,
+                             marker: RunMarker) -> None:
+    try:
+        stored_policy = json.loads((metadata / "policy.json").read_text(encoding="utf-8"))
+        stored_plan = json.loads((metadata / "plan.json").read_text(encoding="utf-8"))
+        policy_digest = (metadata / "policy.sha256").read_text(encoding="ascii").strip()
+        plan_digest = (metadata / "plan.sha256").read_text(encoding="ascii").strip()
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AndroidError("Managed destination metadata is missing or invalid") from exc
+    if stored_policy != policy or stored_plan != plan:
+        raise AndroidError("Managed policy or plan differs from the locked Step 2 data")
+    if (policy_digest, plan_digest) != (marker.policy_sha256, marker.plan_sha256):
+        raise AndroidError("Managed policy or plan digest was modified")
+
+
+def _record_locked_plan(manifest: Manifest, plan: list[dict[str, str]]) -> None:
+    with manifest.transaction() as connection:
+        for row in plan:
+            connection.execute(
+                "INSERT OR IGNORE INTO volumes VALUES (?, ?, ?, ?)",
+                (row["volume"], row["volume"], row["source_root"], int(row["volume"] != "internal")),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO inventory_files VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (row["source_path"], row["volume"], row["relative_path"], row["filename"],
+                 row["extension"], int(row["size_bytes"]), int(row["mtime"]) * 1_000_000_000),
+            )
+            category = FileCategory(row["category"])
+            connection.execute(
+                "INSERT OR IGNORE INTO classifications VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["source_path"], category.value, "Android media/document policy",
+                 row.get("origin", ""), row.get("media_type", ""), row.get("package_name", ""),
+                 row.get("origin_rule", ""), int(row["archive_timestamp"]) if row.get("archive_timestamp") else None,
+                 row.get("archive_month", "unknown_date"), row.get("date_source", "unknown")),
+            )
+            group = row.get("destination_group") or str(Path(row["destination_relative_path"]).parent)
+            connection.execute(
+                "INSERT OR IGNORE INTO destination_groups VALUES (?, 0, ?)",
+                (group, int(bool(row.get("part_number")))),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO destination_mappings VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (row["source_path"], row["destination_relative_path"], group,
+                 int(row.get("position") or 0), int(row["part_number"]) if row.get("part_number") else None,
+                 int(row["collision_index"]), row.get("encoded_filename", row["filename"])),
+            )
+        connection.execute(
+            "UPDATE destination_groups SET file_count = "
+            "(SELECT COUNT(*) FROM destination_mappings WHERE group_key = destination_groups.group_key)"
+        )
+
+
+def _open_adb_stream(adb: object, serial: str, source_path: str) -> BinaryIO:
+    opener = getattr(adb, "open_stream", None)
+    if opener is not None:
+        return opener(serial, source_path)
+    return BytesIO(adb.stream(serial, source_path))
+
+
+def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path,
+              output: Path, retries: int, policy: dict[str, object] | None = None,
+              backup_id: str | None = None) -> tuple[list[dict[str, object]], bool]:
     if retries < 1:
         raise ValueError("retries must be at least 1")
+    backup_id = backup_id or destination.name
+    policy = policy or {"backup_id": backup_id, "device": {"serial": serial, "device_label": "android"}}
+    device = dict(policy.get("device", {}))
+    marker = _run_marker(backup_id, device, policy, plan)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    for folder in ("media", "documents", "metadata"):
-        (destination / folder).mkdir(parents=True, exist_ok=True)
-    required = sum(int(row["size_bytes"]) for row in plan)
-    if shutil.disk_usage(destination.parent).free < required:
-        raise AndroidError(f"Insufficient destination space for {required:,} planned bytes.")
+    if destination.exists():
+        metadata = require_owned_destination(destination, marker)
+        _assert_managed_metadata(metadata, policy, plan, marker)
+    else:
+        metadata = initialize_destination(destination, marker)
+        _write_managed_metadata(metadata, policy, plan, marker)
     output.mkdir(parents=True, exist_ok=True)
-    manifest_path = output / "copy_manifest.csv"
-    previous = {row["source_path"]: row for row in read_csv(manifest_path)} if manifest_path.exists() else {}
     results: list[dict[str, object]] = []
     interrupted = False
-    try:
-        for row in plan:
-            target = destination / Path(row["destination_relative_path"])
-            old = previous.get(row["source_path"])
-            if old and old.get("status") in {"copied", "already_complete"} and target.is_file() and target.stat().st_size == int(row["size_bytes"]) and sha256_file(target) == old.get("sha256"):
-                results.append({**row, "status": "already_complete", "attempts": 0, "sha256": old["sha256"], "reason": "manifest and destination hash match"})
-                continue
-            if target.exists():
-                results.append({**row, "status": "failed", "attempts": 0, "sha256": "", "reason": "pre-existing destination was not proven to be this source; not overwritten"})
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            last_error = ""
-            for attempt in range(1, retries + 1):
-                partial = target.with_name(f".{target.name}.backup-hard-{uuid.uuid4().hex}.partial")
-                try:
-                    adb.pull(serial, row["source_path"], partial)
-                    if partial.stat().st_size != int(row["size_bytes"]):
-                        raise AndroidError("temporary copy size differs from locked plan")
-                    source_hash = sha256_source(adb, serial, row["source_path"])
-                    if sha256_file(partial) != source_hash:
-                        raise AndroidError("temporary copy SHA-256 differs from source")
-                    if target.exists():
-                        raise AndroidError("destination appeared during copy; refusing overwrite")
-                    os.replace(partial, target)
-                    results.append({**row, "status": "copied", "attempts": attempt, "sha256": source_hash, "reason": ""})
-                    break
-                except (AndroidError, OSError) as exc:
-                    last_error = str(exc)
+    manifest_path = metadata / "manifest.sqlite"
+    with Manifest(manifest_path) as manifest:
+        if manifest.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0:
+            manifest.create_run(backup_id, _tool_version(), _source_identity(device, serial))
+            manifest.lock_policy_and_plan(backup_id, policy, plan)
+            _record_locked_plan(manifest, plan)
+        else:
+            manifest.assert_locked_digests(backup_id, policy, plan)
+        completed = manifest.completed_source_paths()
+        cleanup_owned_partials(destination, backup_id)
+        require_free_space(destination, remaining_bytes(
+            {row["source_path"]: int(row["size_bytes"]) for row in plan}, completed
+        ))
+        try:
+            for row in plan:
+                target = destination / Path(row["destination_relative_path"])
+                old = manifest.copy_result(row["source_path"])
+                if (old is not None and old["status"] == CopyStatus.COPIED.value and target.is_file()
+                        and target.stat().st_size == int(row["size_bytes"])
+                        and sha256_file(target) == old["sha256"]):
+                    results.append({**row, "status": "already_verified", "attempts": 0,
+                                    "sha256": old["sha256"], "reason": "SQLite state and destination hash match"})
+                    continue
+                if target.exists():
+                    result = CopyResult(row["source_path"], str(target), CopyStatus.DESTINATION_CONFLICT,
+                                        0, 0, "", "unrelated pre-existing destination was not overwritten")
+                    manifest.record_copy_result(result)
+                    results.append({**row, "status": "failed", "attempts": 0, "sha256": "", "reason": result.detail})
+                    continue
+                last_error = ""
+                for attempt in range(1, retries + 1):
                     try:
-                        partial.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            else:
-                results.append({**row, "status": "failed", "attempts": retries, "sha256": "", "reason": last_error})
-    except KeyboardInterrupt:
-        interrupted = True
+                        current_size, current_mtime = _stat(adb, serial, row["source_path"])
+                        if (current_size, current_mtime) != (int(row["size_bytes"]), int(row["mtime"])):
+                            raise AndroidError("source metadata differs from the locked plan")
+                        stream = _open_adb_stream(adb, serial, row["source_path"])
+                        try:
+                            copied = copy_and_record(row["source_path"], stream, target,
+                                                     int(row["size_bytes"]), backup_id, manifest, attempt)
+                        finally:
+                            stream.close()
+                        results.append({**row, "status": "copied", "attempts": attempt,
+                                        "sha256": copied.sha256, "reason": ""})
+                        break
+                    except (AndroidError, OSError, RuntimeError, DestinationConflict) as exc:
+                        last_error = str(exc)
+                        if attempt < retries:
+                            time.sleep(min(2 ** (attempt - 1), 4))
+                else:
+                    failed = CopyResult(row["source_path"], str(target), CopyStatus.FAILED,
+                                        retries, 0, "", last_error)
+                    manifest.record_copy_result(failed)
+                    results.append({**row, "status": "failed", "attempts": retries,
+                                    "sha256": "", "reason": last_error})
+        except KeyboardInterrupt:
+            interrupted = True
     fields = PLAN_FIELDS + ["status", "attempts", "sha256", "reason"]
-    _write_csv(manifest_path, fields, results)
+    _write_csv(output / "copy_manifest.csv", fields, results)
     _write_csv(output / "copy_failures.csv", fields, [row for row in results if row["status"] == "failed"])
     _write_csv(output / "copy_plan.csv", PLAN_FIELDS, plan)
     counts = Counter(str(row["status"]) for row in results)
@@ -452,9 +660,37 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
 
 def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path,
                 fresh_rows: list[dict[str, object]] | None = None,
-                scan_errors: list[dict[str, str]] | None = None) -> list[dict[str, object]]:
+                scan_errors: list[dict[str, str]] | None = None,
+                policy: dict[str, object] | None = None, backup_id: str | None = None,
+                fresh_metadata: dict[str, object] | None = None) -> list[dict[str, object]]:
     discrepancies: list[dict[str, object]] = []
     scan_errors = scan_errors or []
+    backup_id = backup_id or destination.name
+    policy = policy or {"backup_id": backup_id, "device": {"serial": serial, "device_label": "android"}}
+    device = dict(policy.get("device", {}))
+    marker = _run_marker(backup_id, device, policy, plan)
+    try:
+        metadata = require_owned_destination(destination, marker)
+        _assert_managed_metadata(metadata, policy, plan, marker)
+        manifest_path = metadata / "manifest.sqlite"
+        if not manifest_path.is_file():
+            raise AndroidError("Managed SQLite manifest is missing")
+        connection = sqlite3.connect(f"file:{manifest_path.as_posix()}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT policy_sha256, plan_sha256 FROM runs WHERE backup_id = ?", (backup_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        if row != (marker.policy_sha256, marker.plan_sha256):
+            raise AndroidError("SQLite policy or plan digest differs from the locked run")
+    except (OSError, RuntimeError, ValueError) as exc:
+        discrepancies.append({"source_path": "", "destination_relative_path": ".backup-hard",
+                              "issue": "managed_metadata_invalid", "detail": str(exc)})
+    if fresh_metadata is not None and fresh_metadata != device:
+        discrepancies.append({"source_path": "", "destination_relative_path": "",
+                              "issue": "source_identity_changed",
+                              "detail": "fresh device or volume identity differs from the locked policy"})
     planned_sources = {row["source_path"] for row in plan}
     if fresh_rows is not None:
         for fresh in fresh_rows:
@@ -487,9 +723,18 @@ def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: 
         except (AndroidError, OSError) as exc:
             discrepancies.append({**row, "issue": "hash_failed", "detail": str(exc)})
     if destination.exists():
-        for path in destination.rglob("*"):
-            if path.is_file() and path.relative_to(destination) not in planned_destinations:
-                discrepancies.append({"source_path": "", "destination_relative_path": str(path.relative_to(destination)), "issue": "unexpected_destination_file", "detail": "file is absent from locked plan"})
+        try:
+            for path in destination.rglob("*"):
+                relative = path.relative_to(destination)
+                if relative.parts and relative.parts[0] == ".backup-hard":
+                    continue
+                if path.is_file() and relative not in planned_destinations:
+                    discrepancies.append({"source_path": "", "destination_relative_path": str(relative),
+                                          "issue": "unexpected_destination_file",
+                                          "detail": "file is absent from locked plan"})
+        except OSError as exc:
+            discrepancies.append({"source_path": "", "destination_relative_path": "",
+                                  "issue": "destination_scan_error", "detail": str(exc)})
     output.mkdir(parents=True, exist_ok=True)
     fields = PLAN_FIELDS + ["issue", "detail"]
     _write_csv(output / "validation_discrepancies.csv", fields, discrepancies)
@@ -520,9 +765,14 @@ def copy_main(args: object) -> int:
     policy = json.loads((step_directory(args.reports_root, backup_id, 2) / "android_policy.json").read_text(encoding="utf-8"))
     if policy["device"]["serial"] != args.device_serial:
         raise AndroidError("Selected serial differs from the device locked in Step 2.")
-    plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
-    _, interrupted = copy_plan(Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 3), args.retries)
-    return 130 if interrupted else 0
+    plan = json.loads((step_directory(args.reports_root, backup_id, 2) / "plan.json").read_text(encoding="utf-8"))
+    results, interrupted = copy_plan(
+        Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id),
+        step_directory(args.reports_root, backup_id, 3), args.retries, policy, backup_id,
+    )
+    if interrupted:
+        return 130
+    return 1 if any(row["status"] == "failed" for row in results) else 0
 
 
 def verify_main(args: object) -> int:
@@ -532,7 +782,13 @@ def verify_main(args: object) -> int:
         raise AndroidError("Selected serial differs from the device locked in Step 2.")
     adb = Adb()
     select_device(adb, args.device_serial)
-    plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
-    _, fresh_rows, scan_errors = inventory_device(adb, args.device_serial, policy["device"]["device_label"])
-    discrepancies = verify_plan(adb, args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 4), fresh_rows, scan_errors)
+    plan = json.loads((step_directory(args.reports_root, backup_id, 2) / "plan.json").read_text(encoding="utf-8"))
+    fresh_metadata, fresh_rows, scan_errors = inventory_device(
+        adb, args.device_serial, policy["device"]["device_label"]
+    )
+    discrepancies = verify_plan(
+        adb, args.device_serial, plan, destination_directory_android(args.destination_root, backup_id),
+        step_directory(args.reports_root, backup_id, 4), fresh_rows, scan_errors,
+        policy, backup_id, fresh_metadata,
+    )
     return 1 if discrepancies else 0

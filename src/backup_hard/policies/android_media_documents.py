@@ -65,7 +65,7 @@ def select_archive_date(file: SourceFile) -> tuple[int | None, str, str]:
         except ValueError:
             pass
     if file.mtime_ns > 0:
-        seconds = file.mtime_ns / 1_000_000_000 if file.mtime_ns > 10**12 else file.mtime_ns
+        seconds = file.mtime_ns / 1_000_000_000
         try:
             value = datetime.fromtimestamp(seconds, timezone.utc)
             return int(seconds), value.strftime("%Y_%m"), "filesystem_mtime"

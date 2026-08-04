@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from backup_hard.android import (
     android_media_bucket, classify, copy_plan, create_plan, discover_volumes,
     exclusion_reason, select_device, verify_plan,
 )
+from backup_hard.destination import DestinationError
 
 
 class DeviceAdb:
@@ -47,6 +49,9 @@ class FileAdb:
         destination.write_bytes(self.files[source])
 
     def stream(self, serial, source):
+        self.pull_calls += 1
+        if self.pull_calls <= self.failures:
+            raise AndroidError("transient")
         return self.files[source]
 
     def shell(self, serial, *args, **kwargs):
@@ -161,7 +166,7 @@ class AndroidTests(unittest.TestCase):
             with self.assertRaisesRegex(AndroidError, "already locked"):
                 create_plan(step1, step2, "phone_20260802")
 
-    def test_media_plan_uses_fixed_tree_and_deterministic_filename_conflicts(self):
+    def test_media_plan_uses_origin_type_month_tree(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             step1, step2 = root / "step1", root / "step2"
@@ -181,9 +186,9 @@ class AndroidTests(unittest.TestCase):
                     writer.writerow({"serial": "S", "device_label": "p", "volume": "internal", "source_root": "/s", "source_path": "/s/" + relative, "relative_path": relative, "filename": filename, "extension": Path(filename).suffix, "category": "image", "size_bytes": 10240, "mtime": 1, "status": "included"})
             plan = create_plan(step1, step2, "phone_20260802")
             destinations = [str(row["destination_relative_path"]) for row in plan]
-            self.assertIn("media/photos/social_media/photo.jpg", destinations)
-            self.assertIn("media/photos/social_media/photo_1.jpg", destinations)
-            self.assertIn("media/photos/screenshots/Screenshot_1.png", destinations)
+            self.assertIn("media/whatsapp/images/1970_01/photo.jpg", destinations)
+            self.assertIn("media/telegram/images/1970_01/photo.jpg", destinations)
+            self.assertIn("media/screenshots/images/1970_01/Screenshot_1.png", destinations)
             self.assertEqual(len(destinations), len({value.casefold() for value in destinations}))
 
     def test_copy_retries_is_atomic_and_resume_uses_hash(self):
@@ -198,7 +203,55 @@ class AndroidTests(unittest.TestCase):
             self.assertEqual(results[0]["status"], "copied")
             self.assertFalse(list((root / "backup").rglob("*.partial")))
             results, _ = copy_plan(adb, "SERIAL_A", [row], root / "backup", root / "reports", 3)
-            self.assertEqual(results[0]["status"], "already_complete")
+            self.assertEqual(results[0]["status"], "already_verified")
+
+    def test_managed_copy_persists_locked_metadata_sqlite_and_verifies(self):
+        data = b"x" * 10240
+        row = plan_row(data=data)
+        policy = {"backup_id": "phone_20260804", "device": {
+            "serial": "SERIAL_A", "device_label": "phone", "manufacturer": "HMD",
+            "model": "Nokia", "build_fingerprint": "build", "volumes": [],
+        }}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / "phone_20260804"
+            adb = FileAdb({row["source_path"]: data})
+            results, interrupted = copy_plan(
+                adb, "SERIAL_A", [row], destination, root / "reports", 1,
+                policy, "phone_20260804",
+            )
+            self.assertFalse(interrupted)
+            self.assertEqual(results[0]["status"], "copied")
+            metadata = destination / ".backup-hard"
+            self.assertEqual(
+                {"run.json", "manifest.sqlite", "policy.json", "plan.json", "policy.sha256", "plan.sha256"},
+                {path.name for path in metadata.iterdir() if not path.name.endswith(("-wal", "-shm"))},
+            )
+            connection = sqlite3.connect(metadata / "manifest.sqlite")
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_results").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT status FROM copy_results").fetchone()[0], "copied")
+            finally:
+                connection.close()
+            discrepancies = verify_plan(
+                adb, "SERIAL_A", [row], destination, root / "verify", policy=policy,
+                backup_id="phone_20260804", fresh_metadata=policy["device"],
+            )
+            self.assertFalse(discrepancies)
+
+    def test_resume_refuses_modified_locked_plan(self):
+        data = b"x" * 10240
+        row = plan_row(data=data)
+        policy = {"backup_id": "phone_20260804", "device": {"serial": "SERIAL_A"}}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / "phone_20260804"
+            copy_plan(FileAdb({row["source_path"]: data}), "SERIAL_A", [row], destination,
+                      root / "reports", 1, policy, "phone_20260804")
+            changed = [{**row, "size_bytes": str(len(data) + 1)}]
+            with self.assertRaisesRegex(DestinationError, "different"):
+                copy_plan(FileAdb({row["source_path"]: data}), "SERIAL_A", changed, destination,
+                          root / "reports", 1, policy, "phone_20260804")
 
     def test_copy_never_overwrites_unrelated_destination(self):
         data = b"x" * 10240
@@ -208,8 +261,8 @@ class AndroidTests(unittest.TestCase):
             target = root / "backup" / row["destination_relative_path"]
             target.parent.mkdir(parents=True)
             target.write_bytes(b"unrelated")
-            results, _ = copy_plan(FileAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports", 1)
-            self.assertEqual(results[0]["status"], "failed")
+            with self.assertRaisesRegex(DestinationError, "not owned"):
+                copy_plan(FileAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports", 1)
             self.assertEqual(target.read_bytes(), b"unrelated")
 
     def test_verify_detects_hash_mismatch_changed_source_and_unexpected(self):

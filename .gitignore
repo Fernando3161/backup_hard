@@ -12,6 +12,7 @@ dist/
 .coverage*
 htmlcov/
 /reports/
+/BACKUP_HARD_RUN_REPORT_*.md
 /backup_*/
 /*_????????/
 /android-devices.local.json

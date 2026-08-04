@@ -178,31 +178,24 @@ python -m backup_hard.copy_backup --source-type android \
   --destination-root <destination-root> --retries 3
 ```
 
-The destination is `<destination-root>/nokia_x10_1_20260802/` with `media/`,
-`documents/`, and `metadata/`. Android media uses only this fixed type-based tree:
+The destination is `<destination-root>/nokia_x10_1_20260802/` with managed
+`.backup-hard/` metadata, `media/`, and `documents/`. Android media uses the
+locked origin/type/month layout:
 
 ```text
-media/
-├── audio/
-├── video/
-│   ├── camera/
-│   ├── social_media/
-│   └── other/
-└── photos/
-    ├── camera/
-    ├── social_media/
-    ├── screenshots/
-    └── other/
+media/<origin>/<media-type>/<YYYY_MM>/<file>
 ```
 
-Audio is combined in `media/audio`. Camera classification recognizes DCIM and
-camera paths. Social-media classification recognizes common messaging and social
-apps such as WhatsApp, Facebook, Instagram, Twitter, Reddit, LinkedIn, and
-Telegram. Screenshot names and directories take precedence for photos. Every
-category is flattened; duplicate filenames receive deterministic `_1`, `_2`,
-and later suffixes before the extension. Documents remain flattened by normalized
-extension. All mappings are frozen in Step 2, so reruns reuse the same names and
-unrelated files are never overwritten.
+Groups containing more than 100 files are split completely into `part_001`,
+`part_002`, and later directories; smaller groups have no part directory.
+Destination names are encoded for Windows portability before deterministic
+collision suffixes are assigned. Documents remain grouped by normalized extension.
+All mappings are frozen in Step 2.
+
+`.backup-hard/manifest.sqlite` is the authoritative copy/resume state and commits
+each successful file independently. `run.json`, policy and plan JSON, and their
+SHA-256 digests bind the destination to the exact run, device, and locked plan.
+An unmarked existing destination or a changed identity, policy, or plan is refused.
 
 ```shell
 python -m backup_hard.verify_backup --source-type android \
