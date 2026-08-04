@@ -49,3 +49,13 @@ class AdbRunner:
             )
         except FileNotFoundError as exc:
             raise AdbError("adb was not found; install Android SDK Platform Tools") from exc
+
+    def open_shell(self, serial: str, arguments: Sequence[str]) -> subprocess.Popen:
+        command = " ".join(shlex.quote(argument) for argument in arguments)
+        try:
+            return subprocess.Popen(
+                [self.executable, "-s", serial, "shell", command], shell=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AdbError("adb was not found; install Android SDK Platform Tools") from exc
