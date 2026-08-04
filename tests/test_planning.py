@@ -1,6 +1,6 @@
 import unittest
 
-from backup_hard.engine.planning import PlanningItem, assign_media_groups
+from backup_hard.engine.planning import PlanningItem, assign_media_groups, plan_destinations
 from backup_hard.models import Classification, FileCategory, SourceFile
 
 
@@ -28,6 +28,24 @@ class PlanningTests(unittest.TestCase):
         backward = assign_media_groups(list(reversed(original)))
         self.assertEqual(forward, backward)
         self.assertEqual(forward[100].part_number, 2)
+
+    def test_case_unicode_and_generated_suffix_collisions_are_unique(self) -> None:
+        names = ["photo.jpg", "PHOTO.JPG", "photo_1.jpg", "café.jpg", "cafe\u0301.jpg"]
+        source_items = [PlanningItem(
+            SourceFile("v", f"/{index}/{name}", f"{index}/{name}", name, ".jpg", 10240, index),
+            Classification(True, FileCategory.IMAGE, "test", "camera", "images", archive_timestamp=index, archive_month="2026_08"),
+        ) for index, name in enumerate(names)]
+        mappings = plan_destinations(source_items)
+        keys = [str(mapping.destination_path).casefold() for mapping in mappings]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertGreater(sum(mapping.collision_index > 0 for mapping in mappings), 1)
+
+    def test_documents_are_grouped_by_extension(self) -> None:
+        item = PlanningItem(
+            SourceFile("v", "/Download/report.pdf", "Download/report.pdf", "report.pdf", ".PDF", 1024, 0),
+            Classification(True, FileCategory.DOCUMENT, "test"),
+        )
+        self.assertEqual(str(plan_destinations([item])[0].destination_path), "documents/pdf/report.pdf")
 
 
 if __name__ == "__main__":
