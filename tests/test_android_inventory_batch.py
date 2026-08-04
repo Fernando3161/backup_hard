@@ -22,6 +22,14 @@ class Runner:
         return Process(self.outputs.pop(0))
 
 
+class ProcessRunner:
+    def __init__(self, process):
+        self.process = process
+
+    def open_shell(self, serial, arguments):
+        return self.process
+
+
 class AndroidBatchInventoryTests(unittest.TestCase):
     def test_one_adb_process_per_volume_and_unicode_paths(self):
         first = b"F\x001024\x001700000000\x00/storage/emulated/0/Pictures/caf\xc3\xa9.jpg\x00"
@@ -32,6 +40,15 @@ class AndroidBatchInventoryTests(unittest.TestCase):
         self.assertEqual(runner.calls, 2)
         self.assertEqual([file.filename for file in files], ["caf\xe9.jpg", "a song.mp3"])
         self.assertFalse(errors)
+
+    def test_partial_records_survive_permission_and_truncation_errors(self):
+        output = b"F\x001024\x001700000000\x00/storage/emulated/0/ok.jpg\x00F\x0012"
+        runner = ProcessRunner(Process(output, returncode=1, stderr=b"find: permission denied\n"))
+        files, errors = inventory_source(runner, "serial", [SourceVolume("internal", "internal", "/storage/emulated/0")])
+        self.assertEqual([file.filename for file in files], ["ok.jpg"])
+        self.assertTrue(any("partial inventory" in error for error in errors))
+        self.assertTrue(any("permission denied" in error for error in errors))
+        self.assertTrue(any("exited 1" in error for error in errors))
 
 
 if __name__ == "__main__":

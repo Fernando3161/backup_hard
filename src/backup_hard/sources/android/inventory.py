@@ -11,7 +11,7 @@ from backup_hard.sources.android.adb import AdbRunner
 
 BATCH_SCRIPT = r'''
 root="$1"
-find "$root" -type f -print0 2>/dev/null |
+find "$root" -type f -print0 |
 while IFS= read -r -d '' path; do
   case "$path" in
     "$root/Android/data/"*|"$root/Android/obb/"*) continue ;;
@@ -68,10 +68,14 @@ def inventory_volume(runner: AdbRunner, serial: str, volume: SourceVolume) -> tu
                 raise ValueError(f"Unknown Android inventory record: {kind!r}")
     except StopIteration:
         pass
+    except (ValueError, UnicodeError) as exc:
+        errors.append(f"partial inventory output retained: {exc}")
     stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
     returncode = process.wait()
+    if stderr:
+        errors.extend(line for line in stderr.splitlines() if line.strip())
     if returncode:
-        errors.append(stderr or f"inventory process exited {returncode}")
+        errors.append(f"inventory process exited {returncode}")
     return files, errors
 
 
