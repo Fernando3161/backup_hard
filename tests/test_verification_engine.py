@@ -1,6 +1,6 @@
 import hashlib
 
-from backup_hard.engine.verification import VerificationItem, VerificationSummary, verify_destination
+from backup_hard.engine.verification import VerificationItem, VerificationSummary, verify_destination, verify_items
 from backup_hard.models import VerificationLevel
 
 
@@ -15,3 +15,7 @@ def test_metadata_and_hash_levels(tmp_path):
     item = VerificationItem("source", path, 7, hashlib.sha256(b"content").hexdigest())
     assert verify_destination(item, VerificationLevel.METADATA).passed
     assert verify_destination(item, VerificationLevel.HASH).passed
+
+
+def test_source_scan_error_fails_complete_verification():
+    assert not verify_items([], VerificationLevel.FULL, ["source disconnected"]).passed

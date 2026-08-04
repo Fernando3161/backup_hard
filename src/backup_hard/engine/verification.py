@@ -50,3 +50,14 @@ def verify_destination(item: VerificationItem, level: VerificationLevel) -> Veri
             return VerificationResult(item.source_path, str(item.destination), level, False,
                                       "hash_mismatch", actual)
     return VerificationResult(item.source_path, str(item.destination), level, True)
+
+
+def verify_items(items: list[VerificationItem], level: VerificationLevel,
+                 source_scan_errors: list[str] | None = None) -> VerificationSummary:
+    summary = VerificationSummary(scan_errors=list(source_scan_errors or []))
+    for item in items:
+        try:
+            summary.results.append(verify_destination(item, level))
+        except OSError as exc:
+            summary.scan_errors.append(f"{item.destination}: {exc}")
+    return summary
