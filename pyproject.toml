@@ -8,14 +8,19 @@ version = "0.4.0"
 description = "Staged, resumable, verified filesystem backups"
 requires-python = ">=3.9"
 readme = "README.md"
-license = {text = "Proprietary"}
-authors = [{name = "Backup Hard contributors"}]
+license = {file = "LICENSE"}
+authors = [{name = "Fernando Peñaherrera", email = "fernandopenaherrera@gmail.com"}]
 keywords = ["backup", "filesystem", "verification"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Fernando3161/backup_hard"
+Repository = "https://github.com/Fernando3161/backup_hard"
+Issues = "https://github.com/Fernando3161/backup_hard/issues"
 
 [project.scripts]
 backup-inventory = "backup_hard.inventory:main"

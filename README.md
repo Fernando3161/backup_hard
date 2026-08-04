@@ -257,6 +257,5 @@ should include focused tests.
 
 ## License
 
-No open-source license has been selected. The repository is currently marked
-proprietary; no permission to copy, modify, or redistribute is granted. Select
-and add an explicit license before publishing for third-party reuse.
+Backup Hard is released under the [MIT License](LICENSE). Copyright (c) 2026
+Fernando Peñaherrera.
