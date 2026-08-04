@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from importlib import import_module
 
 
@@ -30,3 +31,19 @@ def main(argv: list[str] | None = None) -> int:
     except TypeError:
         # Transitional legacy commands read sys.argv and are wrapped in commit 29.
         return int(entry())
+
+
+def inventory_main() -> int:
+    return main(["inventory", *sys.argv[1:]])
+
+
+def plan_main() -> int:
+    return main(["plan", *sys.argv[1:]])
+
+
+def copy_main() -> int:
+    return main(["copy", *sys.argv[1:]])
+
+
+def verify_main() -> int:
+    return main(["verify", *sys.argv[1:]])
