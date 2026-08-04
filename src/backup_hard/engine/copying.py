@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,16 @@ def cleanup_owned_partials(directory: Path, run_id: str) -> int:
 class StreamCopyOutcome:
     size_bytes: int
     sha256: str
+
+
+def remaining_bytes(planned_sizes: dict[str, int], completed: set[str]) -> int:
+    return sum(size for path, size in planned_sizes.items() if path not in completed)
+
+
+def require_free_space(destination: Path, required_bytes: int) -> None:
+    available = shutil.disk_usage(destination).free
+    if available < required_bytes:
+        raise CopyError(f"Insufficient free space: need {required_bytes}, have {available}")
 
 
 def copy_and_record(source_path: str, source: BinaryIO, destination: Path,
