@@ -14,7 +14,7 @@ MEDIA_EXTENSIONS = {
     FileCategory.VIDEO: frozenset({".3gp", ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".webm"}),
     FileCategory.AUDIO: frozenset({".aac", ".aiff", ".alac", ".amr", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".opus", ".wav", ".wma"}),
 }
-DOCUMENT_EXTENSIONS = frozenset({".csv", ".doc", ".docx", ".epub", ".html", ".md", ".mobi", ".odp", ".ods", ".odt", ".pdf", ".ppt", ".pptx", ".rtf", ".txt", ".xls", ".xlsx"})
+DOCUMENT_EXTENSIONS = frozenset({".csv", ".doc", ".docm", ".docx", ".epub", ".html", ".md", ".mobi", ".odp", ".ods", ".odt", ".pdf", ".ppt", ".pptx", ".rtf", ".txt", ".xls", ".xlsx"})
 MINIMUM_BYTES = {
     FileCategory.IMAGE: 10 * 1024,
     FileCategory.VIDEO: 1024 * 1024,

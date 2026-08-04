@@ -19,6 +19,11 @@ class PolicyTests(unittest.TestCase):
     def test_android_unknown_extension_is_excluded(self) -> None:
         self.assertFalse(AndroidMediaDocumentsPolicy().classify(source("a.apk", ".apk", 99999), PolicyContext("android")).included)
 
+    def test_android_macro_enabled_word_document_is_included(self) -> None:
+        result = AndroidMediaDocumentsPolicy().classify(source("a.docm", ".DOCM", 4096), PolicyContext("android"))
+        self.assertTrue(result.included)
+        self.assertEqual(result.category, FileCategory.DOCUMENT)
+
     def test_full_filesystem_keeps_unknown_but_excludes_tmp(self) -> None:
         policy = FullFilesystemPolicy()
         self.assertTrue(policy.classify(source("a.unknown", ".unknown", 1), PolicyContext("filesystem")).included)
