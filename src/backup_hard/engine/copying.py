@@ -24,6 +24,19 @@ class DestinationConflict(CopyError):
     pass
 
 
+def cleanup_owned_partials(directory: Path, run_id: str) -> int:
+    """Remove only temporary files created by this run."""
+    removed = 0
+    if not directory.exists():
+        return removed
+    marker = f".backup-hard-{run_id}-"
+    for path in directory.rglob("*.partial"):
+        if marker in path.name and path.is_file():
+            path.unlink()
+            removed += 1
+    return removed
+
+
 @dataclass(frozen=True)
 class StreamCopyOutcome:
     size_bytes: int
