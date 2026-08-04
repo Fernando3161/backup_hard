@@ -51,17 +51,14 @@ INVENTORY_FIELDS = [
 PLAN_FIELDS = [
     "serial", "device_label", "volume", "source_root", "source_path", "relative_path",
     "destination_relative_path", "filename", "extension", "category", "size_bytes", "mtime",
-    "media_folder", "folder_collision_index", "collision_index", "collision_reason",
+    "media_bucket", "collision_index", "collision_reason",
 ]
-APP_LABELS = {
-    "com.whatsapp": "WhatsApp", "org.telegram.messenger": "Telegram",
-    "com.instagram.android": "Instagram", "com.facebook.katana": "Facebook",
-    "com.facebook.orca": "Messenger", "com.camerasideas.instashot": "InShot",
-    "com.reddit.frontpage": "Reddit", "com.linkedin.android": "LinkedIn",
-}
-GENERIC_MEDIA_FOLDERS = {
-    "android", "media", "files", "pictures", "movies", "music", "audio",
-    "video", "image", "images", "downloads", "download", "exports", "export",
+SOCIAL_MEDIA_MARKERS = {
+    "whatsapp", "whassap", "facebook", "instagram", "twitter", "telegram",
+    "reddit", "linkedin", "messenger", "snapchat", "tiktok", "signal",
+    "discord", "threads", "pinterest", "tumblr", "wechat",
+    "com.whatsapp", "com.facebook", "com.instagram", "org.telegram",
+    "com.reddit", "com.linkedin", "com.twitter",
 }
 
 
@@ -93,7 +90,8 @@ class Adb:
         try:
             return subprocess.run(
                 [self.executable, *args], check=check, capture_output=True,
-                text=not binary, shell=False,
+                text=not binary, encoding=None if binary else "utf-8",
+                errors=None if binary else "replace", shell=False,
             )
         except FileNotFoundError as exc:
             raise AndroidError("adb was not found. Install Android SDK Platform Tools and add adb to PATH.") from exc
@@ -297,47 +295,27 @@ def _collision_name(filename: str, index: int) -> str:
     return filename if index == 0 else f"{stem}_{index}{suffix}"
 
 
-def _readable_token(value: str) -> str:
-    words = re.findall(r"[^\W_]+", value, flags=re.UNICODE)
-    return "".join(word[:1].upper() + word[1:] for word in words) or "Media"
-
-
-def preferred_media_folder(relative_path: str, category: str) -> str:
-    """Derive a portable, app-aware folder at one level below the volume."""
-    parts = list(PurePosixPath(relative_path).parts[:-1])
-    folded = [part.casefold() for part in parts]
-    app_label = ""
-    remainder = parts
-    if len(parts) >= 3 and folded[:2] == ["android", "media"]:
-        package = folded[2]
-        app_label = APP_LABELS.get(package, _readable_token(package.split(".")[-1]))
-        remainder = parts[3:]
-    meaningful = [part for part in remainder if part.casefold() not in GENERIC_MEDIA_FOLDERS]
-    leaf = _readable_token(meaningful[-1]) if meaningful else ""
-    if app_label:
-        return leaf if leaf.casefold().startswith(app_label.casefold()) else app_label + (leaf or _readable_token(category + "s"))
-    if leaf:
-        return leaf
-    if parts:
-        return _readable_token(parts[0]) + _readable_token(category + "s")
-    return _readable_token(category + "s")
-
-
-def media_folder_mapping(rows: list[dict[str, str]]) -> dict[tuple[str, str], tuple[str, int]]:
-    """Assign deterministic `_N` suffixes when source folders want the same name."""
-    sources = sorted({
-        (row["volume"], str(PurePosixPath(row["relative_path"]).parent), row["category"])
-        for row in rows if row["category"] != "document"
-    }, key=lambda value: (value[0].casefold(), value[1].casefold(), value[1]))
-    used: dict[tuple[str, str], int] = Counter()
-    result: dict[tuple[str, str], tuple[str, int]] = {}
-    for volume, source_directory, category in sources:
-        preferred = preferred_media_folder(str(PurePosixPath(source_directory) / "placeholder.bin"), category)
-        key = (volume.casefold(), preferred.casefold())
-        index = used[key]
-        used[key] += 1
-        result[(volume, source_directory)] = (preferred if index == 0 else f"{preferred}_{index}", index)
-    return result
+def android_media_bucket(relative_path: str, category: str) -> str:
+    """Return the fixed Android-only media destination directory."""
+    normalized = relative_path.replace("\\", "/").casefold()
+    parts = [part for part in normalized.split("/") if part]
+    filename = parts[-1] if parts else ""
+    if category == "audio":
+        return "media/audio"
+    is_social = any(marker in normalized for marker in SOCIAL_MEDIA_MARKERS)
+    is_camera = "dcim" in parts or "camera" in parts
+    if category == "video":
+        subgroup = "social_media" if is_social else "camera" if is_camera else "other"
+        return f"media/video/{subgroup}"
+    if category == "image":
+        is_screenshot = "screenshot" in filename or "screenshots" in parts
+        subgroup = (
+            "screenshots" if is_screenshot else
+            "social_media" if is_social else
+            "camera" if is_camera else "other"
+        )
+        return f"media/photos/{subgroup}"
+    raise ValueError(f"Unsupported Android media category: {category}")
 
 
 def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, object]]:
@@ -346,7 +324,6 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
     metadata = json.loads((step1 / "device.json").read_text(encoding="utf-8"))
     rows = [row for row in read_csv(step1 / "android_inventory.csv") if row["status"] == "included"]
     used: dict[str, int] = Counter()
-    media_folders = media_folder_mapping(rows)
     plan: list[dict[str, object]] = []
     for row in sorted(rows, key=lambda value: (value["volume"].casefold(), value["relative_path"].casefold(), value["source_path"])):
         if row["category"] == "document":
@@ -356,36 +333,32 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
             used[key] += 1
             destination = f"documents/{folder}/{_collision_name(row['filename'], index)}"
             reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
-            media_folder, folder_index = "", 0
+            media_bucket = ""
         else:
-            source_directory = str(PurePosixPath(row["relative_path"]).parent)
-            media_folder, folder_index = media_folders[(row["volume"], source_directory)]
-            key = f"media/{row['volume']}/{media_folder}/{row['filename']}".casefold()
+            media_bucket = android_media_bucket(row["relative_path"], row["category"])
+            key = f"{media_bucket}/{row['filename']}".casefold()
             index = used[key]
             used[key] += 1
-            destination = f"media/{row['volume']}/{media_folder}/{_collision_name(row['filename'], index)}"
-            reasons = []
-            if folder_index:
-                reasons.append(f"folder-name conflict renamed with deterministic _{folder_index} suffix")
-            if index:
-                reasons.append(f"duplicate filename renamed with deterministic _{index} suffix")
-            reason = "; ".join(reasons)
-        plan.append({**row, "destination_relative_path": destination, "media_folder": media_folder,
-                     "folder_collision_index": folder_index, "collision_index": index,
+            destination = f"{media_bucket}/{_collision_name(row['filename'], index)}"
+            reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
+        plan.append({**row, "destination_relative_path": destination,
+                     "media_bucket": media_bucket, "collision_index": index,
                      "collision_reason": reason})
     output.mkdir(parents=True, exist_ok=False)
     _write_csv(output / "android_plan.csv", PLAN_FIELDS, plan)
-    policy = {"schema_version": 2, "source_type": "android", "status": "locked", "backup_id": backup_id,
+    policy = {"schema_version": 3, "source_type": "android", "status": "locked", "backup_id": backup_id,
               "device": metadata, "media_extensions": {k: sorted(v) for k, v in MEDIA_EXTENSIONS.items()},
               "document_extensions": sorted(DOCUMENT_EXTENSIONS), "global_minimum_bytes": GLOBAL_MINIMUM,
               "category_minimum_bytes": CATEGORY_MINIMUMS, "excluded_directory_names": sorted(EXCLUDED_DIRECTORY_NAMES),
               "excluded_path_prefixes": sorted(EXCLUDED_PATH_PREFIXES), "streaming_markers": sorted(STREAMING_MARKERS),
-              "media_layout": "media/<volume>/<app-aware-folder>/<flattened-file>",
-              "maximum_media_subfolders_below_volume": 1,
-              "folder_collision_strategy": "deterministic numeric suffix",
+              "media_layout": {
+                  "audio": ["media/audio"],
+                  "video": ["media/video/camera", "media/video/social_media", "media/video/other"],
+                  "photos": ["media/photos/camera", "media/photos/social_media", "media/photos/screenshots", "media/photos/other"],
+              },
+              "social_media_markers": sorted(SOCIAL_MEDIA_MARKERS),
               "file_collision_strategy": "deterministic numeric suffix before extension",
-              "app_labels": APP_LABELS, "expected_file_count": len(plan),
-              "expected_bytes": sum(int(row["size_bytes"]) for row in plan)}
+              "expected_file_count": len(plan), "expected_bytes": sum(int(row["size_bytes"]) for row in plan)}
     (output / "android_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "format_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     _write_csv(output / "format_selection.csv", ["extension", "category", "minimum_size_bytes"], [
@@ -393,7 +366,7 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
         for category, extensions in {**MEDIA_EXTENSIONS, "document": DOCUMENT_EXTENSIONS}.items() for ext in sorted(extensions)
     ])
     (output / "format_selection_report.md").write_text(
-        f"# Step 2 — Locked Android copy plan\n\n> Status: **LOCKED**\n\n- Files: **{len(plan):,}**\n- Bytes: **{policy['expected_bytes']:,}**\n- Media uses one app-aware folder below each volume; folder and file conflicts use deterministic numeric suffixes.\n- Documents use deterministic flattened names.\n",
+        f"# Step 2 — Locked Android copy plan\n\n> Status: **LOCKED**\n\n- Files: **{len(plan):,}**\n- Bytes: **{policy['expected_bytes']:,}**\n- Media is flattened into the fixed audio, video, and photo category directories.\n- Duplicate filenames use deterministic numeric suffixes.\n- Documents remain flattened by extension.\n",
         encoding="utf-8",
     )
     return plan

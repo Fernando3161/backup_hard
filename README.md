@@ -179,13 +179,30 @@ python -m backup_hard.copy_backup --source-type android \
 ```
 
 The destination is `<destination-root>/nokia_x10_1_20260802/` with `media/`,
-`documents/`, and `metadata/`. Android media uses exactly one app-aware folder
-below its volume: `media/<volume>/<folder>/<file>`. For example, WhatsApp images
-map to `media/internal/WhatsAppImages/`. Distinct source folders that request the
-same readable name receive deterministic `_1`, `_2`, and later suffixes. Media
-filename collisions are similarly suffixed before the extension. Documents are
-flattened by normalized extension. All mappings are frozen in Step 2, so reruns
-reuse the same names; unrelated files are never overwritten.
+`documents/`, and `metadata/`. Android media uses only this fixed type-based tree:
+
+```text
+media/
+├── audio/
+├── video/
+│   ├── camera/
+│   ├── social_media/
+│   └── other/
+└── photos/
+    ├── camera/
+    ├── social_media/
+    ├── screenshots/
+    └── other/
+```
+
+Audio is combined in `media/audio`. Camera classification recognizes DCIM and
+camera paths. Social-media classification recognizes common messaging and social
+apps such as WhatsApp, Facebook, Instagram, Twitter, Reddit, LinkedIn, and
+Telegram. Screenshot names and directories take precedence for photos. Every
+category is flattened; duplicate filenames receive deterministic `_1`, `_2`,
+and later suffixes before the extension. Documents remain flattened by normalized
+extension. All mappings are frozen in Step 2, so reruns reuse the same names and
+unrelated files are never overwritten.
 
 ```shell
 python -m backup_hard.verify_backup --source-type android \
