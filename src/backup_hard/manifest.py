@@ -122,6 +122,18 @@ class Manifest:
             "SELECT * FROM copy_results WHERE source_path = ?", (source_path,)
         ).fetchone()
 
+    def begin_copy_attempt(self, source_path: str, attempt: int) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO copy_attempts(source_path, attempt, status) VALUES (?, ?, 'started')",
+                (source_path, attempt),
+            )
+
+    def completed_source_paths(self) -> set[str]:
+        return {row[0] for row in self.connection.execute(
+            "SELECT source_path FROM copy_results WHERE status = 'copied'"
+        )}
+
     @staticmethod
     def canonical_digest(value: object) -> str:
         payload = json.dumps(

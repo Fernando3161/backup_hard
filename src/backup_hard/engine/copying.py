@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from backup_hard.manifest import Manifest
+from backup_hard.models import CopyResult, CopyStatus
+
 
 DEFAULT_BLOCK_SIZE = 1024 * 1024
 
@@ -25,6 +28,18 @@ class DestinationConflict(CopyError):
 class StreamCopyOutcome:
     size_bytes: int
     sha256: str
+
+
+def copy_and_record(source_path: str, source: BinaryIO, destination: Path,
+                    expected_size: int, run_id: str, manifest: Manifest,
+                    attempt: int = 1) -> CopyResult:
+    """Persist attempt and outcome independently so interruption is resumable."""
+    manifest.begin_copy_attempt(source_path, attempt)
+    outcome = stream_to_destination(source, destination, expected_size, run_id)
+    result = CopyResult(source_path, str(destination), CopyStatus.COPIED, attempt,
+                        outcome.size_bytes, outcome.sha256, "")
+    manifest.record_copy_result(result)
+    return result
 
 
 def stream_to_destination(
