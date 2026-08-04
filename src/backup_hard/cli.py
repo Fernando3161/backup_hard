@@ -12,6 +12,7 @@ COMMAND_MODULES = {
     "plan": "backup_hard.select_formats",
     "copy": "backup_hard.copy_backup",
     "verify": "backup_hard.verify_backup",
+    "report": "backup_hard.reports",
 }
 
 
