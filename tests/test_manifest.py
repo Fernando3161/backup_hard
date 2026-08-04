@@ -33,6 +33,17 @@ class ManifestTests(unittest.TestCase):
                         raise KeyboardInterrupt
                 self.assertEqual(manifest.connection.execute("SELECT COUNT(*) FROM errors").fetchone()[0], 0)
 
+    def test_policy_and_plan_digests_are_canonical_and_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with Manifest(Path(temp) / "manifest.sqlite") as manifest:
+                identity = SourceIdentity("android", "id", "phone")
+                manifest.create_run("phone_20260804", "test", identity)
+                first = manifest.lock_policy_and_plan("phone_20260804", {"b": 2, "a": 1}, [{"x": 1}])
+                second = manifest.lock_policy_and_plan("phone_20260804", {"a": 1, "b": 2}, [{"x": 1}])
+                self.assertEqual(first, second)
+                with self.assertRaisesRegex(ManifestError, "changed"):
+                    manifest.lock_policy_and_plan("phone_20260804", {"a": 9}, [{"x": 1}])
+
 
 if __name__ == "__main__":
     unittest.main()

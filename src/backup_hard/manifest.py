@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -120,3 +121,36 @@ class Manifest:
         return self.connection.execute(
             "SELECT * FROM copy_results WHERE source_path = ?", (source_path,)
         ).fetchone()
+
+    @staticmethod
+    def canonical_digest(value: object) -> str:
+        payload = json.dumps(
+            value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def lock_policy_and_plan(self, backup_id: str, policy: object, plan: object) -> tuple[str, str]:
+        policy_digest = self.canonical_digest(policy)
+        plan_digest = self.canonical_digest(plan)
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT policy_sha256, plan_sha256 FROM runs WHERE backup_id = ?", (backup_id,)
+            ).fetchone()
+            if row is None:
+                raise ManifestError(f"Unknown run: {backup_id}")
+            existing = (row["policy_sha256"], row["plan_sha256"])
+            if existing != (None, None) and existing != (policy_digest, plan_digest):
+                raise ManifestError("Locked policy or plan digest changed")
+            connection.execute(
+                "UPDATE runs SET policy_sha256 = ?, plan_sha256 = ? WHERE backup_id = ?",
+                (policy_digest, plan_digest, backup_id),
+            )
+        return policy_digest, plan_digest
+
+    def assert_locked_digests(self, backup_id: str, policy: object, plan: object) -> None:
+        row = self.connection.execute(
+            "SELECT policy_sha256, plan_sha256 FROM runs WHERE backup_id = ?", (backup_id,)
+        ).fetchone()
+        expected = (self.canonical_digest(policy), self.canonical_digest(plan))
+        if row is None or (row["policy_sha256"], row["plan_sha256"]) != expected:
+            raise ManifestError("Policy or plan does not match the locked run")
