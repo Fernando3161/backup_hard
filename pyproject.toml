@@ -23,6 +23,7 @@ Repository = "https://github.com/Fernando3161/backup_hard"
 Issues = "https://github.com/Fernando3161/backup_hard/issues"
 
 [project.scripts]
+backup-hard = "backup_hard.cli:main"
 backup-inventory = "backup_hard.inventory:main"
 backup-select-formats = "backup_hard.select_formats:main"
 backup-copy = "backup_hard.copy_backup:main"
