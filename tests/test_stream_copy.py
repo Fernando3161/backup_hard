@@ -44,6 +44,14 @@ class StreamCopyTests(unittest.TestCase):
             self.assertFalse((root / "target").exists())
             self.assertFalse(list(root.glob("*.partial")))
 
+    def test_long_destination_name_uses_short_owned_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / (("x" * 190) + ".bin")
+            result = stream_to_destination(LogicalStream(3), target, 3, "long_run_identifier")
+            self.assertEqual(result.size_bytes, 3)
+            self.assertTrue(target.is_file())
+            self.assertFalse(list(Path(temp).glob("*.partial")))
+
 
 if __name__ == "__main__":
     unittest.main()

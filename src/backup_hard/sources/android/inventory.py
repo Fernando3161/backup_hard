@@ -11,11 +11,8 @@ from backup_hard.sources.android.adb import AdbRunner
 
 BATCH_SCRIPT = r'''
 root="$1"
-find "$root" -type f -print0 |
+find "$root" \( -path "$root/Android/data" -o -path "$root/Android/obb" \) -prune -o -type f -print0 |
 while IFS= read -r -d '' path; do
-  case "$path" in
-    "$root/Android/data/"*|"$root/Android/obb/"*) continue ;;
-  esac
   size=$(stat -c %s -- "$path" 2>/dev/null) || { printf 'E\0%s\0stat failed\0' "$path"; continue; }
   mtime=$(stat -c %Y -- "$path" 2>/dev/null) || { printf 'E\0%s\0stat failed\0' "$path"; continue; }
   printf 'F\0%s\0%s\0%s\0' "$size" "$mtime" "$path"

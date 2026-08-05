@@ -30,12 +30,16 @@ def cleanup_owned_partials(directory: Path, run_id: str) -> int:
     removed = 0
     if not directory.exists():
         return removed
-    marker = f".backup-hard-{run_id}-"
+    markers = (f".backup-hard-{_run_token(run_id)}-", f".backup-hard-{run_id}-")
     for path in directory.rglob("*.partial"):
-        if marker in path.name and path.is_file():
+        if any(marker in path.name for marker in markers) and path.is_file():
             path.unlink()
             removed += 1
     return removed
+
+
+def _run_token(run_id: str) -> str:
+    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -80,7 +84,7 @@ def stream_to_destination(
         raise DestinationConflict(f"Destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(
-        f".{destination.name}.backup-hard-{run_id}-{uuid.uuid4().hex}.partial"
+        f".backup-hard-{_run_token(run_id)}-{uuid.uuid4().hex[:16]}.partial"
     )
     digest = hashlib.sha256()
     count = 0

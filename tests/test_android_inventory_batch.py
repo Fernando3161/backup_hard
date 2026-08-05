@@ -2,7 +2,7 @@ import io
 import unittest
 
 from backup_hard.models import SourceVolume
-from backup_hard.sources.android.inventory import inventory_source
+from backup_hard.sources.android.inventory import BATCH_SCRIPT, inventory_source
 
 
 class Process:
@@ -31,6 +31,11 @@ class ProcessRunner:
 
 
 class AndroidBatchInventoryTests(unittest.TestCase):
+    def test_batch_script_prunes_inaccessible_app_directories(self):
+        self.assertIn('-path "$root/Android/data"', BATCH_SCRIPT)
+        self.assertIn('-path "$root/Android/obb"', BATCH_SCRIPT)
+        self.assertIn("-prune", BATCH_SCRIPT)
+
     def test_one_adb_process_per_volume_and_unicode_paths(self):
         first = b"F\x001024\x001700000000\x00/storage/emulated/0/Pictures/caf\xc3\xa9.jpg\x00"
         second = b"F\x002048\x001700000001\x00/storage/ABCD/Music/a song.mp3\x00"
