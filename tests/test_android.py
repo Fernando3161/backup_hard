@@ -7,9 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from collections import Counter
+from datetime import datetime, timezone
+
+from backup_hard.android import media_origin as android_media_origin
+from backup_hard.paths import destination_collision_key
 from backup_hard.android import (
     Adb, AndroidError, Device, Volume, CATEGORY_MINIMUMS, GLOBAL_MINIMUM,
-    android_media_bucket, classify, copy_plan, create_plan, discover_volumes,
+    archive_month, classify, copy_plan, create_plan, discover_volumes,
     exclusion_reason, select_device, verify_plan,
 )
 
@@ -69,21 +74,112 @@ def plan_row(source="/storage/emulated/0/DCIM/a.jpg", destination="media/interna
 
 
 class AndroidTests(unittest.TestCase):
-    def test_android_media_category_tree(self):
+    def test_media_origin_rules(self):
         cases = {
-            ("Music/song.opus", "audio"): "media/audio",
-            ("DCIM/Camera/clip.mp4", "video"): "media/video/camera",
-            ("Android/media/com.whatsapp/clip.mp4", "video"): "media/video/social_media",
-            ("Download/clip.mp4", "video"): "media/video/other",
-            ("DCIM/Camera/photo.jpg", "image"): "media/photos/camera",
-            ("Pictures/Screenshots/Screenshot_1.png", "image"): "media/photos/screenshots",
-            ("DCIM/Screenshots/Screenshot_2.png", "image"): "media/photos/screenshots",
-            ("Android/media/org.telegram.messenger/photo.jpg", "image"): "media/photos/social_media",
-            ("Download/photo.jpg", "image"): "media/photos/other",
+            "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/IMG-20260109-WA0018.jpg": "whatsapp",
+            "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes/202150/PTT-20211207-WA0004.opus": "whatsapp",
+            "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Images/IMG-1.jpg": "whatsapp_business",
+            "Android/media/org.telegram.messenger/Telegram/Telegram Images/a.jpg": "telegram",
+            "Android/media/com.google.android.gm/attachments/a.jpg": "gmail",
+            "Android/media/com.example.newapp/export.jpg": "newapp",
+            "DCIM/Camera/20260801_101010.jpg": "camera",
+            "DCIM/IMG_0001.jpg": "camera",
+            "DCIM/Screenshots/Screenshot_20260801_101010.png": "screenshots",
+            "Pictures/Screenshot_1.png": "screenshots",
+            "DCIM/Screen recordings/rec.mp4": "screen_recordings",
+            "DCIM/Document scans/Scan_20260920_212938.jpg": "document_scans",
+            "DCIM/Expert RAW/a.dng": "expert_raw",
+            "Pictures/WhatsApp/a.jpg": "whatsapp",
+            "WhatsApp/Media/WhatsApp Images/legacy.jpg": "whatsapp",
+            "Pictures/inshot/a.jpg": "inshot",
+            "Pictures/ChatGPT/a.png": "chatgpt",
+            "Movies/Edits/a.mp4": "edits",
+            "Pictures/loose.jpg": "other",
+            "Download/a.jpg": "downloads",
+            "Download/Budapest_Night_9_JPG_Original_Filenames/a.jpg": "downloads",
+            "Recordings/Voice Recorder/a.m4a": "recordings",
+            "Music/Samsung/song.m4a": "music",
+            "random/a.jpg": "other",
         }
-        for (path, category), expected in cases.items():
+        for path, expected in cases.items():
             with self.subTest(path=path):
-                self.assertEqual(android_media_bucket(path, category), expected)
+                self.assertEqual(android_media_origin(path)[0], expected)
+
+    def test_archive_month_prefers_filename_date_then_mtime(self):
+        july_2026 = int(datetime(2026, 7, 15, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(archive_month("IMG-20260109-WA0018.jpg", july_2026)[1:], ("2026_01", "filename"))
+        self.assertEqual(archive_month("Screenshot_2025-12-31-23-59.png", july_2026)[1:], ("2025_12", "filename"))
+        self.assertEqual(archive_month("photo.jpg", july_2026)[1:], ("2026_07", "mtime"))
+        self.assertEqual(archive_month("photo.jpg", 0)[1:], ("unknown_date", "unknown"))
+        # Hex/hash-like digits that are not a valid date fall back to mtime.
+        self.assertEqual(archive_month("84b6a4482019133199.file", july_2026)[1:], ("2026_07", "mtime"))
+        self.assertEqual(archive_month("x20991301y.jpg", july_2026)[1:], ("2026_07", "mtime"))
+
+    def _write_inventory(self, step1, rows):
+        step1.mkdir()
+        (step1 / "device.json").write_text(json.dumps({"serial": "S", "device_label": "p", "volumes": []}), encoding="utf-8")
+        fields = ["serial", "device_label", "manufacturer", "model", "volume", "source_root", "source_path", "relative_path", "filename", "extension", "category", "size_bytes", "mtime", "status", "exclusion_reason"]
+        with (step1 / "android_inventory.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for relative, category, mtime in rows:
+                filename = Path(relative).name
+                writer.writerow({"serial": "S", "device_label": "p", "volume": "internal", "source_root": "/s",
+                                 "source_path": "/s/" + relative, "relative_path": relative, "filename": filename,
+                                 "extension": Path(filename).suffix.casefold(), "category": category,
+                                 "size_bytes": 20480, "mtime": mtime, "status": "included"})
+
+    def test_media_plan_layout_parts_and_collisions(self):
+        aug = int(datetime(2026, 8, 10, tzinfo=timezone.utc).timestamp())
+        rows = [(f"DCIM/Camera/IMG_{index:04d}.jpg", "image", aug + index) for index in range(101)]
+        rows += [
+            ("Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/IMG-20260109-WA0001.jpg", "image", aug),
+            ("Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/Sent/IMG-20260109-WA0001.jpg", "image", aug),
+            ("Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes/202150/PTT-20211207-WA0004.opus", "audio", aug),
+            ("Download/Café.jpg", "image", aug), ("Download/Café.JPG", "image", aug),
+            ("Download/bad:name?.jpg", "image", aug),
+            ("Download/report.pdf", "document", aug),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_inventory(root / "step1", rows)
+            plan = create_plan(root / "step1", root / "step2", "phone_20260802")
+            by_source = {row["relative_path"]: row for row in plan}
+            camera = [row for row in plan if row["origin"] == "camera"]
+            self.assertEqual(Counter(row["part"] for row in camera), {"part_001": 100, "part_002": 1})
+            self.assertEqual(by_source["DCIM/Camera/IMG_0000.jpg"]["destination_relative_path"],
+                             "media/camera/images/2026_08/part_001/IMG_0000.jpg")
+            self.assertEqual(by_source["DCIM/Camera/IMG_0100.jpg"]["destination_relative_path"],
+                             "media/camera/images/2026_08/part_002/IMG_0100.jpg")
+            wa = sorted(row["destination_relative_path"] for row in plan if "IMG-20260109" in str(row["filename"]))
+            self.assertEqual(wa, ["media/whatsapp/images/2026_01/IMG-20260109-WA0001.jpg",
+                                  "media/whatsapp/images/2026_01/IMG-20260109-WA0001_1.jpg"])
+            self.assertEqual(by_source["Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes/202150/PTT-20211207-WA0004.opus"]["destination_relative_path"],
+                             "media/whatsapp/audio/2021_12/PTT-20211207-WA0004.opus")
+            cafe = sorted(row["collision_index"] for row in plan if row["relative_path"].startswith("Download/Caf"))
+            self.assertEqual(cafe, [0, 1])
+            unsafe = by_source["Download/bad:name?.jpg"]
+            self.assertEqual(unsafe["destination_relative_path"], "media/downloads/images/2026_08/bad%3Aname%3F.jpg")
+            self.assertIn("Windows-safe", unsafe["collision_reason"])
+            self.assertEqual(by_source["Download/report.pdf"]["destination_relative_path"], "documents/pdf/report.pdf")
+            keys = [destination_collision_key(str(row["destination_relative_path"])) for row in plan]
+            self.assertEqual(len(keys), len(set(keys)))
+            policy = json.loads((root / "step2" / "android_policy.json").read_text(encoding="utf-8"))
+            self.assertEqual(policy["max_files_per_media_folder"], 100)
+
+    def test_media_plan_is_deterministic_regardless_of_inventory_order(self):
+        aug = int(datetime(2026, 8, 10, tzinfo=timezone.utc).timestamp())
+        rows = [(f"Pictures/WhatsApp/{name}", "image", aug + index) for index, name in
+                enumerate(["b.jpg", "A.jpg", "a.jpg", "c.jpg"] * 60)]
+        rows = [(f"{path[:-4]}_{i}{path[-4:]}" if i % 7 == 0 else path, category, mtime) for i, (path, category, mtime) in enumerate(rows)]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_inventory(root / "a1", rows)
+            self._write_inventory(root / "b1", list(reversed(rows)))
+            first = create_plan(root / "a1", root / "a2", "phone_20260802")
+            second = create_plan(root / "b1", root / "b2", "phone_20260802")
+        mapping = lambda plan: sorted((row["source_path"], row["destination_relative_path"]) for row in plan)
+        self.assertEqual(mapping(first), mapping(second))
 
     def test_shell_quotes_metacharacters_and_unusual_filenames(self):
         adb = Adb("adb")
@@ -177,31 +273,6 @@ class AndroidTests(unittest.TestCase):
             self.assertEqual([r["destination_relative_path"] for r in plan], ["documents/pdf/report.pdf", "documents/pdf/report_1.pdf", "documents/pdf/report_2.pdf", "documents/pdf/report_3.pdf"])
             with self.assertRaisesRegex(AndroidError, "already locked"):
                 create_plan(step1, step2, "phone_20260802")
-
-    def test_media_plan_uses_fixed_tree_and_deterministic_filename_conflicts(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            step1, step2 = root / "step1", root / "step2"
-            step1.mkdir()
-            (step1 / "device.json").write_text(json.dumps({"serial": "S", "device_label": "p", "volumes": []}), encoding="utf-8")
-            fields = ["serial", "device_label", "manufacturer", "model", "volume", "source_root", "source_path", "relative_path", "filename", "extension", "category", "size_bytes", "mtime", "status", "exclusion_reason"]
-            relatives = [
-                "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/photo.jpg",
-                "Android/media/org.telegram.messenger/Telegram Images/photo.jpg",
-                "Pictures/Screenshots/Screenshot_1.png",
-            ]
-            with (step1 / "android_inventory.csv").open("w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
-                for relative in relatives:
-                    filename = Path(relative).name
-                    writer.writerow({"serial": "S", "device_label": "p", "volume": "internal", "source_root": "/s", "source_path": "/s/" + relative, "relative_path": relative, "filename": filename, "extension": Path(filename).suffix, "category": "image", "size_bytes": 10240, "mtime": 1, "status": "included"})
-            plan = create_plan(step1, step2, "phone_20260802")
-            destinations = [str(row["destination_relative_path"]) for row in plan]
-            self.assertIn("media/photos/social_media/photo.jpg", destinations)
-            self.assertIn("media/photos/social_media/photo_1.jpg", destinations)
-            self.assertIn("media/photos/screenshots/Screenshot_1.png", destinations)
-            self.assertEqual(len(destinations), len({value.casefold() for value in destinations}))
 
     def test_copy_retries_is_atomic_and_resume_uses_hash(self):
         data = b"x" * 10240

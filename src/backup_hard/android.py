@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterable, Sequence
 
 from backup_hard.backup_run import step_directory, validate_backup_id
+from backup_hard.paths import destination_collision_key, encode_windows_name
 
 
 MEDIA_EXTENSIONS = {
@@ -60,14 +61,30 @@ PLAN_FIELDS = [
     "serial", "device_label", "volume", "source_root", "source_path", "relative_path",
     "destination_relative_path", "filename", "extension", "category", "size_bytes", "mtime",
     "media_bucket", "collision_index", "collision_reason",
+    "origin", "origin_rule", "media_type", "archive_month", "date_source", "part",
 ]
-SOCIAL_MEDIA_MARKERS = {
-    "whatsapp", "whassap", "facebook", "instagram", "twitter", "telegram",
-    "reddit", "linkedin", "messenger", "snapchat", "tiktok", "signal",
-    "discord", "threads", "pinterest", "tumblr", "wechat",
-    "com.whatsapp", "com.facebook", "com.instagram", "org.telegram",
-    "com.reddit", "com.linkedin", "com.twitter",
+# Media layout: media/<origin>/<images|videos|audio>/<YYYY_MM>/[part_NNN/]<file>
+MAX_FILES_PER_FOLDER = 100
+MEDIA_TYPE_FOLDERS = {"image": "images", "video": "videos", "audio": "audio"}
+ORIGIN_PACKAGES = {
+    "com.whatsapp": "whatsapp", "com.whatsapp.w4b": "whatsapp_business",
+    "org.telegram.messenger": "telegram", "org.thoughtcrime.securesms": "signal",
+    "com.instagram.android": "instagram", "com.instagram.barcelona": "threads",
+    "com.facebook.katana": "facebook", "com.facebook.orca": "messenger",
+    "com.snapchat.android": "snapchat", "com.zhiliaoapp.musically": "tiktok",
+    "com.reddit.frontpage": "reddit", "com.linkedin.android": "linkedin",
+    "com.twitter.android": "twitter", "com.discord": "discord",
+    "com.google.android.gm": "gmail", "com.camerasideas.instashot": "inshot",
 }
+ORIGIN_APP_KEYWORDS = (
+    "whatsapp", "telegram", "signal", "instagram", "threads", "facebook", "messenger",
+    "snapchat", "tiktok", "reddit", "linkedin", "twitter", "discord", "wechat",
+)
+ORIGIN_FOLDER_MARKERS = (
+    ("download", "downloads"), ("downloads", "downloads"), ("recordings", "recordings"),
+    ("music", "music"), ("podcasts", "podcasts"), ("bluetooth", "bluetooth"),
+)
+FILENAME_DATE = re.compile(r"(?<!\d)(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)(?!\d)")
 
 
 class AndroidError(RuntimeError):
@@ -380,70 +397,152 @@ def _collision_name(filename: str, index: int) -> str:
     return filename if index == 0 else f"{stem}_{index}{suffix}"
 
 
-def android_media_bucket(relative_path: str, category: str) -> str:
-    """Return the fixed Android-only media destination directory."""
-    normalized = relative_path.replace("\\", "/").casefold()
-    parts = [part for part in normalized.split("/") if part]
-    filename = parts[-1] if parts else ""
-    if category == "audio":
-        return "media/audio"
-    is_social = any(marker in normalized for marker in SOCIAL_MEDIA_MARKERS)
-    is_camera = "dcim" in parts or "camera" in parts
-    if category == "video":
-        subgroup = "social_media" if is_social else "camera" if is_camera else "other"
-        return f"media/video/{subgroup}"
-    if category == "image":
-        is_screenshot = "screenshot" in filename or "screenshots" in parts
-        subgroup = (
-            "screenshots" if is_screenshot else
-            "social_media" if is_social else
-            "camera" if is_camera else "other"
-        )
-        return f"media/photos/{subgroup}"
-    raise ValueError(f"Unsupported Android media category: {category}")
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+
+
+def media_origin(relative_path: str) -> tuple[str, str]:
+    """Return (origin, rule) for a media file: which app or place it came from.
+
+    Rules, first match wins:
+    1. `Android/media/<package>/...`: known package name, else the package's last segment.
+    2. Screenshots and screen recordings, by folder or file name.
+    3. `DCIM/Camera` is `camera`; any other DCIM subfolder uses its own name.
+    4. A known chat or social app named anywhere in the folder path.
+    5. A `Pictures/<app>` or `Movies/<app>` subfolder uses its own name.
+    6. Downloads, recordings, music, podcasts, Bluetooth; otherwise `other`.
+    """
+    parts = [part for part in relative_path.replace("\\", "/").split("/") if part]
+    folders = [part.casefold() for part in parts[:-1]]
+    filename = parts[-1].casefold() if parts else ""
+    if len(folders) >= 3 and folders[:2] == ["android", "media"]:
+        package = folders[2]
+        if package in ORIGIN_PACKAGES:
+            return ORIGIN_PACKAGES[package], f"known package {parts[2]}"
+        return _slug(package.split(".")[-1]) or "other", f"Android/media package {parts[2]}"
+    if any(folder in {"screen recordings", "screen_recordings", "screenrecorder"} for folder in folders):
+        return "screen_recordings", "screen recordings folder"
+    if "screenshots" in folders or filename.startswith("screenshot"):
+        return "screenshots", "screenshots folder or file name"
+    if folders[:1] == ["dcim"]:
+        if len(folders) == 1 or folders[1] == "camera":
+            return "camera", "DCIM/Camera"
+        return _slug(folders[1]) or "camera", f"DCIM subfolder {parts[1]}"
+    for folder in folders:
+        for keyword in ORIGIN_APP_KEYWORDS:
+            if keyword in folder:
+                return keyword, f"app name in folder {folder}"
+    if len(folders) >= 2 and folders[0] in {"pictures", "movies"}:
+        return _slug(folders[1]) or "other", f"{parts[0]} subfolder {parts[1]}"
+    for marker, origin in ORIGIN_FOLDER_MARKERS:
+        if folders[:1] == [marker]:
+            return origin, f"top-level folder {parts[0]}"
+    return "other", "no origin rule matched"
+
+
+def archive_month(filename: str, mtime: int) -> tuple[int | None, str, str]:
+    """Return (timestamp, YYYY_MM, source): the date in the file name, else the file's mtime (UTC)."""
+    latest_year = datetime.now(timezone.utc).year + 1
+    for match in FILENAME_DATE.finditer(filename):
+        year, month, day = (int(part) for part in match.groups())
+        if 2000 <= year <= latest_year:
+            try:
+                value = datetime(year, month, day, tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            return int(value.timestamp()), value.strftime("%Y_%m"), "filename"
+    if mtime > 0:
+        try:
+            value = datetime.fromtimestamp(mtime, timezone.utc)
+            return mtime, value.strftime("%Y_%m"), "mtime"
+        except (OverflowError, OSError, ValueError):
+            pass
+    return None, "unknown_date", "unknown"
 
 
 def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, object]]:
+    """Lock the destination of every included file.
+
+    Media: `media/<origin>/<images|videos|audio>/<YYYY_MM>/<file>`. A month folder
+    with more than MAX_FILES_PER_FOLDER files is split into `part_001`,
+    `part_002`, ... in date order. Documents: `documents/<extension>/<file>`.
+    Names are made Windows-safe, and names that would clash (ignoring case and
+    Unicode normalization) get deterministic `_1`, `_2` suffixes.
+    """
     if (output / "android_plan.csv").exists() or (output / "android_policy.json").exists():
         raise AndroidError("Android Step 2 is already locked; use a new backup ID to change the plan.")
     metadata = json.loads((step1 / "device.json").read_text(encoding="utf-8"))
     rows = [row for row in read_csv(step1 / "android_inventory.csv") if row["status"] == "included"]
-    used: dict[str, int] = Counter()
-    plan: list[dict[str, object]] = []
-    for row in sorted(rows, key=lambda value: (value["volume"].casefold(), value["relative_path"].casefold(), value["source_path"])):
+
+    groups: dict[str, list[dict[str, object]]] = {}
+    documents: list[dict[str, object]] = []
+    for row in rows:
         if row["category"] == "document":
             folder = row["extension"].lstrip(".") or "no_extension"
-            key = f"{folder}/{row['filename']}".casefold()
-            index = used[key]
-            used[key] += 1
-            destination = f"documents/{folder}/{_collision_name(row['filename'], index)}"
-            reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
-            media_bucket = ""
-        else:
-            media_bucket = android_media_bucket(row["relative_path"], row["category"])
-            key = f"{media_bucket}/{row['filename']}".casefold()
-            index = used[key]
-            used[key] += 1
-            destination = f"{media_bucket}/{_collision_name(row['filename'], index)}"
-            reason = "" if index == 0 else f"duplicate filename renamed with deterministic _{index} suffix"
-        plan.append({**row, "destination_relative_path": destination,
-                     "media_bucket": media_bucket, "collision_index": index,
-                     "collision_reason": reason})
+            documents.append({**row, "origin": "", "origin_rule": "", "media_type": "", "archive_month": "",
+                              "date_source": "", "part": "", "_group": f"documents/{folder}", "_sort": None})
+            continue
+        origin, rule = media_origin(row["relative_path"])
+        timestamp, month, date_source = archive_month(row["filename"], int(row["mtime"] or 0))
+        media_type = MEDIA_TYPE_FOLDERS[row["category"]]
+        group = f"media/{origin}/{media_type}/{month}"
+        groups.setdefault(group, []).append({
+            **row, "origin": origin, "origin_rule": rule, "media_type": media_type, "archive_month": month,
+            "date_source": date_source, "part": "", "_group": group, "_sort": timestamp,
+        })
+
+    ordered: list[dict[str, object]] = []
+    for group in sorted(groups, key=str.casefold):
+        members = sorted(groups[group], key=lambda item: (
+            item["_sort"] if item["_sort"] is not None else 2**63 - 1,
+            str(item["filename"]).casefold(), str(item["filename"]), str(item["volume"]), str(item["source_path"])))
+        split = len(members) > MAX_FILES_PER_FOLDER
+        for offset, item in enumerate(members):
+            if split:
+                item["part"] = f"part_{offset // MAX_FILES_PER_FOLDER + 1:03d}"
+                item["_group"] = f"{group}/{item['part']}"
+            ordered.append(item)
+    ordered.extend(sorted(documents, key=lambda item: (
+        str(item["_group"]).casefold(), str(item["relative_path"]).casefold(), str(item["source_path"]))))
+
+    used: set[str] = set()
+    plan: list[dict[str, object]] = []
+    for item in ordered:
+        directory = str(item.pop("_group"))
+        item.pop("_sort")
+        encoded = encode_windows_name(str(item["filename"]))
+        index = 0
+        while True:
+            candidate = f"{directory}/{_collision_name(encoded.encoded, index)}"
+            key = destination_collision_key(candidate)
+            if key not in used:
+                used.add(key)
+                break
+            index += 1
+        reasons = []
+        if encoded.encoded != item["filename"]:
+            reasons.append("name shortened for Windows" if encoded.shortened else "name made Windows-safe")
+        if index:
+            reasons.append(f"duplicate name renamed with deterministic _{index} suffix")
+        plan.append({**item, "destination_relative_path": candidate, "media_bucket": directory,
+                     "collision_index": index, "collision_reason": "; ".join(reasons)})
+
     output.mkdir(parents=True, exist_ok=False)
     _write_csv(output / "android_plan.csv", PLAN_FIELDS, plan)
-    policy = {"schema_version": 3, "source_type": "android", "status": "locked", "backup_id": backup_id,
+    folder_sizes = Counter(str(row["media_bucket"]) for row in plan)
+    policy = {"schema_version": 4, "source_type": "android", "status": "locked", "backup_id": backup_id,
               "device": metadata, "media_extensions": {k: sorted(v) for k, v in MEDIA_EXTENSIONS.items()},
               "document_extensions": sorted(DOCUMENT_EXTENSIONS), "global_minimum_bytes": GLOBAL_MINIMUM,
               "category_minimum_bytes": CATEGORY_MINIMUMS, "excluded_directory_names": sorted(EXCLUDED_DIRECTORY_NAMES),
               "excluded_path_prefixes": sorted(EXCLUDED_PATH_PREFIXES),
-              "excluded_sticker_directory_names": sorted(EXCLUDED_STICKER_DIRECTORY_NAMES),"streaming_markers": sorted(STREAMING_MARKERS),
-              "media_layout": {
-                  "audio": ["media/audio"],
-                  "video": ["media/video/camera", "media/video/social_media", "media/video/other"],
-                  "photos": ["media/photos/camera", "media/photos/social_media", "media/photos/screenshots", "media/photos/other"],
-              },
-              "social_media_markers": sorted(SOCIAL_MEDIA_MARKERS),
-              "file_collision_strategy": "deterministic numeric suffix before extension",
+              "excluded_sticker_directory_names": sorted(EXCLUDED_STICKER_DIRECTORY_NAMES),
+              "streaming_markers": sorted(STREAMING_MARKERS),
+              "media_layout": "media/<origin>/<images|videos|audio>/<YYYY_MM>/[part_NNN/]<file>",
+              "document_layout": "documents/<extension>/<file>",
+              "max_files_per_media_folder": MAX_FILES_PER_FOLDER,
+              "origin_packages": ORIGIN_PACKAGES, "origin_app_keywords": list(ORIGIN_APP_KEYWORDS),
+              "archive_date": "date in file name (YYYYMMDD, YYYY-MM-DD, YYYY_MM_DD), else file mtime in UTC",
+              "file_collision_strategy": "Windows-safe name; case- and Unicode-insensitive clash check; deterministic _N suffix",
               "expected_file_count": len(plan), "expected_bytes": sum(int(row["size_bytes"]) for row in plan)}
     (output / "android_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "format_policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -451,10 +550,17 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
         {"extension": ext, "category": category, "minimum_size_bytes": max(GLOBAL_MINIMUM, CATEGORY_MINIMUMS[category])}
         for category, extensions in {**MEDIA_EXTENSIONS, "document": DOCUMENT_EXTENSIONS}.items() for ext in sorted(extensions)
     ])
-    (output / "format_selection_report.md").write_text(
-        f"# Step 2 — Locked Android copy plan\n\n> Status: **LOCKED**\n\n- Files: **{len(plan):,}**\n- Bytes: **{policy['expected_bytes']:,}**\n- Media is flattened into the fixed audio, video, and photo category directories.\n- Duplicate filenames use deterministic numeric suffixes.\n- Documents remain flattened by extension.\n",
-        encoding="utf-8",
-    )
+    origins = Counter(str(row["origin"]) for row in plan if row["origin"])
+    lines = [
+        "# Step 2 — Locked Android copy plan", "", "> Status: **LOCKED**", "",
+        f"- Files: **{len(plan):,}**", f"- Bytes: **{policy['expected_bytes']:,}**",
+        f"- Folders: **{len(folder_sizes):,}**, largest media folder **{max((v for k, v in folder_sizes.items() if k.startswith('media/')), default=0):,}** files",
+        "- Media layout: `media/<origin>/<images|videos|audio>/<YYYY_MM>/[part_NNN/]<file>`",
+        "- Documents: `documents/<extension>/<file>`", "", "## Media files by origin", "",
+        "| Origin | Files |", "|---|---|",
+        *(f"| {origin} | {count:,} |" for origin, count in origins.most_common()), "",
+    ]
+    (output / "format_selection_report.md").write_text("\n".join(lines), encoding="utf-8")
     return plan
 
 
