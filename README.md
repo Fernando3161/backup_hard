@@ -1,279 +1,143 @@
 # Backup Hard
 
-Backup Hard is a dependency-free Python application for staged, resumable, and
-independently verified filesystem backups. It inventories a source tree, locks
-a reviewable format policy, copies selected files while preserving relative
-paths, and validates the result with fresh source and destination scans.
+Staged, resumable, and verified file backups of a folder, a drive, or an
+Android phone. Each backup runs in four steps: inventory, lock a plan, copy,
+and verify. Every step writes reviewable reports to `reports/<backup-id>/step_N/`.
 
-> This is a file-level backup tool, not a bootable disk-imaging solution.
+It uses only Python's standard library. It is a file-level backup tool, not a
+disk-imaging tool.
 
-## Features
+## Installation
 
-- Four auditable stages: inventory, policy locking, copy, and verification.
-- Stable `source_label_YYYYMMDD` backup IDs.
-- Source-relative directory preservation for every selected file.
-- Atomic file replacement, retries, and safe resumability.
-- CSV, JSON, and Markdown reports grouped under `reports/<backup-id>/step_N`.
-- Full-format and strict OS media/document policies.
-- Android shared-storage media/document backups over ADB.
-- OS path exclusions and content-specific minimum file sizes.
-- Standard-library-only runtime; Windows long-path handling is included.
+Requires Python 3.9 or newer. Install into a local virtual environment in the
+repository root, never into your base Python.
 
-## Repository structure
+Windows (PowerShell):
 
-```text
-.
-├── .github/workflows/ci.yml     # automated checks
-├── examples/backup_workflow.ipynb
-├── src/backup_hard/             # application modules
-├── tests/                       # unittest suite and notebook checks
-├── pyproject.toml               # packaging and CLI entry points
-└── reports/                     # generated locally; ignored by Git
-```
-
-## Prerequisites and installation
-
-- Python 3.9 or newer.
-- Read access to the source tree.
-- A separate destination with enough free space.
-
-From the repository root:
-
-```shell
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-No runtime packages beyond Python's standard library are required.
-
-## Android prerequisites and scope
-
-Install Google's Android SDK Platform Tools so `adb` is on `PATH`. Enable
-Developer options and USB debugging on the phone, connect through USB or
-configured wireless ADB, unlock the phone, and accept its authorization prompt.
+macOS and Linux:
 
 ```shell
-adb devices -l
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-The ADB serial is the stable identity. This distinguishes two phones with the
-same model; give each serial a readable label such as `nokia_x10_1` and
-`nokia_x10_2`. Labels, serials, and destination paths are not stored in tracked
-configuration.
+Activate the environment in every new terminal before running any command
+below; the prompt shows `(.venv)` while it is active. If PowerShell blocks
+activation, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
 
-Android mode scans every accessible shared-storage volume rather than an app
-whitelist. Internal storage is `internal`; removable storage is `sd_card` (or
-`sd_card_<short-id>` for multiple cards). Storage aliases are deduplicated.
-Eligible media under `Android/media`, including files from messaging, social,
-and editing apps, is included based on its file type.
+## Placeholders
 
-Supported types cover common/modern images, video, audio, office documents,
-text, and e-books. Matching is case-insensitive. Exact minimums are:
+Replace each placeholder, including the angle brackets, with your own value.
+Quote paths that contain spaces.
 
-- All files: 1,024 bytes.
-- Images: 10,240 bytes.
-- Audio: 2,048 bytes.
-- Video: 1,048,576 bytes.
-- Documents: 1,024 bytes.
+| Placeholder | Meaning |
+|---|---|
+| `<backup-id>` | Name for one backup: `<source-label>_<YYYYMMDD>`, lowercase letters, digits, and underscores |
+| `<source-path>` | Folder or drive to back up |
+| `<destination-root>` | Writable folder that receives the backup |
+| `<device-serial>` | Phone's serial, from `adb devices -l` |
+| `<device-label>` | Readable name you choose for the phone |
 
-Files exactly at a threshold are included. Android mode excludes unsupported
-types, temporary/incomplete downloads, cache/thumbnail/trash directories,
-`Android/data`, `Android/obb`, package/expansion data, known offline
-streaming caches, and WhatsApp sticker folders (`WhatsApp Stickers`,
-`WhatsApp Backup Excluded Stickers`, and the WhatsApp Business equivalents).
-It never uses root, installs software, deletes source data,
-or prunes destinations.
+## Filesystem backup
 
-Android scoped storage limits what ADB can read. Private app data, Samsung
-Secure Folder content, protected system data, and other inaccessible content
-cannot be backed up without elevated access and are outside this tool's scope.
-
-## Configuration
-
-A backup ID must contain a lowercase source label and an eight-digit date, for
-example `archive_disk_20260801`. Commands default to `./reports`; use
-`--reports-root` to place generated reports elsewhere.
-
-The destination is derived automatically:
-
-```text
-<destination-root>/backup_<backup-id>/
-```
-
-For an OS media/document policy, `--exclude-relative-prefix` may be repeated to
-exclude source-relative application or report trees that are specific to your
-machine. Use forward slashes or your platform's normal path separator.
-
-## Basic workflow
-
-The examples below use repository-relative sample locations. Create the source
-and destination-root directories before running them.
-
-### 1. Inventory
+The backup is written to `<destination-root>/backup_<backup-id>/`.
 
 ```shell
-python -m backup_hard.inventory --backup-id archive_disk_20260801 --source ./example-source
+# 1. Inventory. Review step_1/scan_errors.csv afterwards.
+python -m backup_hard.inventory --backup-id <backup-id> --source "<source-path>"
+
+# 2. Lock the formats to copy: all formats...
+python -m backup_hard.select_formats --backup-id <backup-id> --lock-all
+#    ...or only media and documents from an OS disk
+python -m backup_hard.select_formats --backup-id <backup-id> --os-media-documents
+
+# 3. Copy. Safe to rerun; finished files are skipped.
+python -m backup_hard.copy_backup --backup-id <backup-id> --source "<source-path>" --destination-root "<destination-root>"
+
+# 4. Verify
+python -m backup_hard.verify_backup --backup-id <backup-id> --source "<source-path>" --destination-root "<destination-root>"
 ```
 
-Review `reports/archive_disk_20260801/step_1/scan_errors.csv` before continuing.
+The OS media/document policy skips system, program, temporary, and log
+folders. Add `--exclude-relative-prefix "<folder>"` to skip more; it can be
+repeated.
 
-### 2. Lock formats
+## Android backup
 
-Include all inventoried extensions except explicit temporary exclusions:
+Install Google's Android SDK Platform Tools so `adb` is on `PATH`. On the phone,
+enable USB debugging, connect it, unlock it, and accept the authorization
+prompt. `adb devices -l` then lists its serial. Use a separate `<backup-id>`
+for each phone.
+
+The backup is written to `<destination-root>/<backup-id>/`.
 
 ```shell
-python -m backup_hard.select_formats --backup-id archive_disk_20260801 --lock-all
+# 1. Inventory, read-only. Review android_inventory.csv and scan_errors.csv.
+python -m backup_hard.inventory --source-type android --backup-id <backup-id> --device-serial <device-serial> --device-label <device-label>
+
+# 2. Lock the plan. Offline; runs once per backup ID.
+python -m backup_hard.select_formats --backup-id <backup-id> --android-media-documents
+
+# 3. Copy. Safe to rerun; finished files are skipped.
+python -m backup_hard.copy_backup --source-type android --backup-id <backup-id> --device-serial <device-serial> --destination-root "<destination-root>"
+
+# 4. Verify
+python -m backup_hard.verify_backup --source-type android --backup-id <backup-id> --device-serial <device-serial> --destination-root "<destination-root>"
 ```
 
-For an OS disk containing only media and documents:
+**What is copied.** Images, video, audio, and documents from all readable
+shared storage, above a minimum size: 10 KiB for images, 2 KiB for audio, 1 MiB
+for video, and 1 KiB for everything else. Caches, thumbnails, trash,
+`Android/data`, `Android/obb`, streaming caches, and WhatsApp sticker folders
+are skipped. Private app data cannot be read over ADB. Unreadable folders are
+listed in `scan_errors.csv` and the rest of the scan continues.
 
-```shell
-python -m backup_hard.select_formats --backup-id system_media_20260801 --os-media-documents --exclude-relative-prefix path/to/generated/reports
-```
-
-The OS policy excludes common system, program, temporary, log, Anaconda, and
-gaming directories. Its minimums are 1 KiB globally, 10 KiB for images/audio,
-and 1 MiB for documents/videos.
-
-### 3. Copy
-
-```shell
-python -m backup_hard.copy_backup --backup-id archive_disk_20260801 --source ./example-source --destination-root ./example-output --retries 3
-```
-
-Rerunning the same command is safe. Files with matching size and modification
-time are reported as already present.
-
-### 4. Verify
-
-```shell
-python -m backup_hard.verify_backup --backup-id archive_disk_20260801 --source ./example-source --destination-root ./example-output
-```
-
-A zero exit status means the fresh scans, locked policy, plan, and destination
-agree. Review every nonzero result in `step_4/validation_discrepancies.csv`.
-
-## Android four-stage workflow
-
-Repeat all four steps with a unique backup ID for each phone. Step 1 inventories
-without copying:
-
-```shell
-python -m backup_hard.inventory --source-type android \
-  --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
-  --device-label nokia_x10_1
-```
-
-Review Step 1, then lock the immutable file plan and deterministic document
-collision names:
-
-```shell
-python -m backup_hard.select_formats \
-  --backup-id nokia_x10_1_20260802 --android-media-documents
-```
-python -m backup_hard.select_formats --backup-id samsung_s25u_20261106 --android-media-documents
-
-Copy to a user-selected root:
-
-```shell
-python -m backup_hard.copy_backup --source-type android \
-  --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
-  --destination-root <destination-root> --retries 3
-```
-
-Android copies run 4 ADB pulls in parallel (`--workers N` to change). Source
-SHA-256 hashes are computed on the device in batches instead of streaming every
-file a second time; a retry re-hashes that one source fresh.
-
-python -m backup_hard.copy_backup --source-type android \
-  --backup-id samsung_s25u_20261106 --device-serial RZCY11Z14EV \
-  --destination-root "C:/temp/fall_travel_pics" --retries 3
-
-
-
-The destination is `<destination-root>/nokia_x10_1_20260802/` with `media/`,
-`documents/`, and `metadata/`. Android media uses only this fixed type-based tree:
+**How files are arranged.** Documents go in `documents/` by extension. Media is
+sorted into this tree, with `_1`, `_2` suffixes for duplicate names:
 
 ```text
 media/
 ├── audio/
-├── video/
-│   ├── camera/
-│   ├── social_media/
-│   └── other/
-└── photos/
-    ├── camera/
-    ├── social_media/
-    ├── screenshots/
-    └── other/
+├── video/   camera/  social_media/  other/
+└── photos/  camera/  social_media/  screenshots/  other/
 ```
 
-Audio is combined in `media/audio`. Camera classification recognizes DCIM and
-camera paths. Social-media classification recognizes common messaging and social
-apps such as WhatsApp, Facebook, Instagram, Twitter, Reddit, LinkedIn, and
-Telegram. Screenshot names and directories take precedence for photos. Every
-category is flattened; duplicate filenames receive deterministic `_1`, `_2`,
-and later suffixes before the extension. Documents remain flattened by normalized
-extension. All mappings are frozen in Step 2, so reruns reuse the same names and
-unrelated files are never overwritten.
+**How it is checked.** Copy and verify compare SHA-256 hashes computed on the
+phone with hashes of the copied files. Verify also rescans the phone and fails
+on new, changed, missing, or extra files. Folders already listed as unreadable
+in Step 1 are reported but do not fail verification. Copy and verify accept
+`--workers N`, which defaults to 4.
 
-```shell
-python -m backup_hard.verify_backup --source-type android --backup-id samsung_s25u_20261106 --device-serial RZCY11Z14EV --destination-root "C:/temp/fall_travel_pics"
-```
-
-python -m backup_hard.verify_backup --source-type android \
-  --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
-  --destination-root <destination-root>
-```
-
-
-Step 4 performs a fresh full scan and fresh source-to-destination SHA-256 checks.
-It fails nonzero for inaccessible/new/changed sources, missing or unexpected
-destinations, size differences, or hash differences, and modifies neither side.
-
-## Example notebook
-
-`examples/backup_workflow.ipynb` runs all four stages against synthetic files.
-It writes only to a unique directory beneath the ignored
-`examples/example-output/` tree and does not use local disks or existing reports.
-
-`examples/android_mock_workflow.py` demonstrates Android classification and
-exclusion decisions using synthetic paths and needs neither ADB nor a phone.
-
-## Testing and validation
-
-```shell
-python -m compileall -q src tests
-python -m unittest discover -s tests -v
-python -m backup_hard.inventory --help
-python -m backup_hard.select_formats --help
-python -m backup_hard.copy_backup --help
-python -m backup_hard.verify_backup --help
-```
-
-CI runs these checks on supported Python versions and executes the notebook
-through the standard-library notebook test harness.
+To redo Step 2, delete `reports/<backup-id>/step_2/` first.
 
 ## Troubleshooting
 
-- **Access denied:** review `scan_errors.csv`. Run with appropriate permissions,
-  or explicitly exclude paths that are outside the desired backup scope.
-- **Insufficient space:** Step 3 checks free space before creating the backup.
-- **Validation changed after copying:** active source files may have changed or
-  new matching files may have appeared. Rerun Step 3, then Step 4.
-- **Unexpected destination files:** use a clean destination for a changed policy;
-  resumable copying does not automatically delete files excluded later.
-- **Reparse points skipped:** directory links are deliberately not traversed to
-  avoid loops and crossing into unrelated volumes.
+- **Verify reports changed or new files:** the source changed after Step 1.
+  Rerun Step 3, then Step 4.
+- **Verify reports unexpected files:** the destination holds files outside the
+  plan, often from an earlier policy. Use a clean destination.
+- **Access denied:** check `scan_errors.csv`, then run with the needed
+  permissions or exclude that path.
 
-## Contributing
+## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Do not commit real backup reports,
-personal paths, credentials, or user data. Changes to copy or verification logic
-should include focused tests.
+```shell
+python -m unittest discover -s tests -v
+```
+
+`examples/` holds a synthetic end-to-end notebook and an Android demo that need
+no real disk or phone. See [CONTRIBUTING.md](CONTRIBUTING.md), and never commit
+real reports, personal paths, or device serials.
 
 ## License
 
-No open-source license has been selected. The repository is currently marked
-proprietary; no permission to copy, modify, or redistribute is granted. Select
-and add an explicit license before publishing for third-party reuse.
+Proprietary. No permission to copy, modify, or redistribute is granted.
