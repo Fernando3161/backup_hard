@@ -661,18 +661,60 @@ def device_sha256(adb: Adb, serial: str, path: str) -> str:
 COPY_HASH_CHUNK = 500
 
 
+MARKER_DIRECTORY = ".backup-hard"
+MARKER_FILE = "run.json"
+
+
+def run_marker(backup_id: str, serial: str, plan_path: Path) -> dict[str, object]:
+    """Identity of one backup run: backup ID, phone, and a fingerprint of the locked plan."""
+    return {"schema_version": 1, "tool": "backup-hard", "backup_id": backup_id, "device_serial": serial,
+            "plan_sha256": sha256_file(plan_path)}
+
+
+def read_marker(destination: Path) -> dict[str, object] | None:
+    try:
+        return json.loads((destination / MARKER_DIRECTORY / MARKER_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def claim_destination(destination: Path, marker: dict[str, object]) -> None:
+    """Make sure the backup folder belongs to this run before anything is written.
+
+    A new or empty folder is claimed by writing the marker. An existing folder is
+    accepted only when its marker matches this backup ID, phone, and plan, so a
+    resume continues safely while files from another run or layout are never mixed in.
+    """
+    existing = read_marker(destination)
+    if existing is not None:
+        if {key: existing.get(key) for key in marker} != marker:
+            raise AndroidError(
+                f"{destination} belongs to a different backup run or plan "
+                f"({existing.get('backup_id')}). Use a new backup ID or an empty destination.")
+        return
+    if destination.exists() and any(destination.iterdir()):
+        raise AndroidError(
+            f"{destination} already contains files that were not created by this backup run "
+            "(for example an older backup with a different folder layout). "
+            "Use a new backup ID, or move that folder away first.")
+    (destination / MARKER_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    (destination / MARKER_DIRECTORY / MARKER_FILE).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+
+
 def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path, retries: int,
-              workers: int = 4) -> tuple[list[dict[str, object]], bool]:
+              workers: int = 4, marker: dict[str, object] | None = None) -> tuple[list[dict[str, object]], bool]:
     if retries < 1:
         raise ValueError("retries must be at least 1")
     if workers < 1:
         raise ValueError("workers must be at least 1")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    for folder in ("media", "documents", "metadata"):
-        (destination / folder).mkdir(parents=True, exist_ok=True)
     required = sum(int(row["size_bytes"]) for row in plan)
     if shutil.disk_usage(destination.parent).free < required:
         raise AndroidError(f"Insufficient destination space for {required:,} planned bytes.")
+    if marker is not None:
+        claim_destination(destination, marker)
+    for folder in ("media", "documents"):
+        (destination / folder).mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     _remove_leftover_temporaries(destination)
     manifest_path = output / "copy_manifest.csv"
@@ -768,7 +810,8 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
 def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path,
                 fresh_rows: list[dict[str, object]] | None = None,
                 scan_errors: list[dict[str, str]] | None = None, workers: int = 4,
-                known_scan_errors: list[dict[str, str]] | None = None) -> list[dict[str, object]]:
+                known_scan_errors: list[dict[str, str]] | None = None,
+                expected_marker: dict[str, object] | None = None) -> list[dict[str, object]]:
     """Verify the copy against the locked plan.
 
     `known_scan_errors` are Step 1's scan_errors.csv rows. A fresh "Permission
@@ -863,9 +906,21 @@ def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: 
         hasher.shutdown(wait=True, cancel_futures=True)
     for found in per_row:
         discrepancies.extend(found)
+    if expected_marker is not None:
+        actual = read_marker(destination)
+        if actual is None:
+            discrepancies.append({"source_path": "", "destination_relative_path": f"{MARKER_DIRECTORY}/{MARKER_FILE}",
+                                  "issue": "destination_marker_missing", "detail": "backup folder has no run marker"})
+        elif {key: actual.get(key) for key in expected_marker} != expected_marker:
+            discrepancies.append({"source_path": "", "destination_relative_path": f"{MARKER_DIRECTORY}/{MARKER_FILE}",
+                                  "issue": "destination_marker_mismatch",
+                                  "detail": "backup folder belongs to a different backup ID, phone, or plan"})
     if destination.exists():
         for path in destination.rglob("*"):
-            if path.is_file() and path.relative_to(destination) not in planned_destinations:
+            relative = path.relative_to(destination)
+            if relative.parts[:1] == (MARKER_DIRECTORY,):
+                continue
+            if path.is_file() and relative not in planned_destinations:
                 discrepancies.append({"source_path": "", "destination_relative_path": str(path.relative_to(destination)), "issue": "unexpected_destination_file", "detail": "file is absent from locked plan"})
     output.mkdir(parents=True, exist_ok=True)
     fields = PLAN_FIELDS + ["issue", "detail"]
@@ -901,8 +956,11 @@ def copy_main(args: object) -> int:
     policy = json.loads((step_directory(args.reports_root, backup_id, 2) / "android_policy.json").read_text(encoding="utf-8"))
     if policy["device"]["serial"] != args.device_serial:
         raise AndroidError("Selected serial differs from the device locked in Step 2.")
-    plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
-    _, interrupted = copy_plan(Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 3), args.retries, getattr(args, "workers", 4))
+    plan_path = step_directory(args.reports_root, backup_id, 2) / "android_plan.csv"
+    plan = read_csv(plan_path)
+    _, interrupted = copy_plan(Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id),
+                               step_directory(args.reports_root, backup_id, 3), args.retries, getattr(args, "workers", 4),
+                               run_marker(backup_id, args.device_serial, plan_path))
     return 130 if interrupted else 0
 
 
@@ -913,10 +971,12 @@ def verify_main(args: object) -> int:
         raise AndroidError("Selected serial differs from the device locked in Step 2.")
     adb = Adb()
     select_device(adb, args.device_serial)
-    plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
+    plan_path = step_directory(args.reports_root, backup_id, 2) / "android_plan.csv"
+    plan = read_csv(plan_path)
     step1_errors_path = step_directory(args.reports_root, backup_id, 1) / "scan_errors.csv"
     known_scan_errors = read_csv(step1_errors_path) if step1_errors_path.exists() else []
     _, fresh_rows, scan_errors = inventory_device(adb, args.device_serial, policy["device"]["device_label"])
     discrepancies = verify_plan(adb, args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 4), fresh_rows, scan_errors,
-                                getattr(args, "workers", 4), known_scan_errors)
+                                getattr(args, "workers", 4), known_scan_errors,
+                                run_marker(backup_id, args.device_serial, plan_path))
     return 1 if discrepancies else 0

@@ -854,5 +854,78 @@ class TemporaryFileAndStreamingTests(unittest.TestCase):
                 adb.stream_sha256("S", Path(temp, "missing.bin").as_posix())
 
 
+class DestinationMarkerTests(unittest.TestCase):
+    def _marker(self, root, backup_id="phone_20260802", serial="S", plan_text="plan v1"):
+        from backup_hard.android import run_marker
+        plan_path = root / f"plan-{plan_text}.csv"
+        plan_path.write_text(plan_text, encoding="utf-8")
+        return run_marker(backup_id, serial, plan_path)
+
+    def test_new_destination_is_claimed_and_resume_is_allowed(self):
+        from backup_hard.android import read_marker
+        data = b"m" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = self._marker(root)
+            adb = FileAdb({row["source_path"]: data})
+            results, _ = copy_plan(adb, "S", [row], root / "backup", root / "reports", 1, marker=marker)
+            self.assertEqual(results[0]["status"], "copied")
+            self.assertEqual(read_marker(root / "backup"), marker)
+            results, _ = copy_plan(adb, "S", [row], root / "backup", root / "reports", 1, marker=marker)
+            self.assertEqual(results[0]["status"], "already_complete")
+
+    def test_existing_folder_without_marker_is_refused_untouched(self):
+        data = b"m" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = root / "backup" / "media" / "photos" / "camera" / "old.jpg"
+            old.parent.mkdir(parents=True)
+            old.write_bytes(b"old layout")
+            with self.assertRaisesRegex(AndroidError, "not created by this backup run"):
+                copy_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports", 1,
+                          marker=self._marker(root))
+            self.assertEqual(sorted(p.relative_to(root / "backup").as_posix() for p in (root / "backup").rglob("*") if p.is_file()),
+                             ["media/photos/camera/old.jpg"])
+
+    def test_empty_existing_folder_is_claimed(self):
+        data = b"m" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "backup").mkdir()
+            results, _ = copy_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports", 1,
+                                   marker=self._marker(root))
+            self.assertEqual(results[0]["status"], "copied")
+
+    def test_marker_from_a_different_plan_is_refused(self):
+        data = b"m" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adb = FileAdb({row["source_path"]: data})
+            copy_plan(adb, "S", [row], root / "backup", root / "reports", 1, marker=self._marker(root, plan_text="plan v1"))
+            with self.assertRaisesRegex(AndroidError, "different backup run or plan"):
+                copy_plan(adb, "S", [row], root / "backup", root / "reports", 1, marker=self._marker(root, plan_text="plan v2"))
+
+    def test_verify_checks_marker_and_ignores_marker_folder(self):
+        data = b"m" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adb = FileAdb({row["source_path"]: data})
+            marker = self._marker(root)
+            copy_plan(adb, "S", [row], root / "backup", root / "reports", 1, marker=marker)
+            fresh = [{**row, "size_bytes": len(data), "mtime": 100, "status": "included"}]
+            self.assertEqual(verify_plan(adb, "S", [row], root / "backup", root / "v1", fresh, [], expected_marker=marker), [])
+            other = self._marker(root, plan_text="plan v2")
+            issues = [d["issue"] for d in verify_plan(adb, "S", [row], root / "backup", root / "v2", fresh, [], expected_marker=other)]
+            self.assertEqual(issues, ["destination_marker_mismatch"])
+            (root / "backup" / ".backup-hard" / "run.json").unlink()
+            issues = [d["issue"] for d in verify_plan(adb, "S", [row], root / "backup", root / "v3", fresh, [], expected_marker=marker)]
+            self.assertEqual(issues, ["destination_marker_missing"])
+
+
 if __name__ == "__main__":
     unittest.main()
