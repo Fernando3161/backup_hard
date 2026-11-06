@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backup-hard"
-version = "0.4.0"
+version = "2.0.0"
 description = "Staged, resumable, verified filesystem backups"
 requires-python = ">=3.9"
 readme = "README.md"
