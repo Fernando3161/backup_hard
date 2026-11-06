@@ -678,12 +678,12 @@ def read_marker(destination: Path) -> dict[str, object] | None:
         return None
 
 
-def claim_destination(destination: Path, marker: dict[str, object]) -> None:
-    """Make sure the backup folder belongs to this run before anything is written.
+def check_destination(destination: Path, marker: dict[str, object]) -> bool:
+    """Read-only ownership check. Returns True when the folder still has to be claimed.
 
-    A new or empty folder is claimed by writing the marker. An existing folder is
-    accepted only when its marker matches this backup ID, phone, and plan, so a
-    resume continues safely while files from another run or layout are never mixed in.
+    An existing folder is accepted only when its marker matches this backup ID,
+    phone, and plan, so a resume continues safely while files from another run or
+    layout are never mixed in. A new or empty folder needs claiming.
     """
     existing = read_marker(destination)
     if existing is not None:
@@ -691,12 +691,34 @@ def claim_destination(destination: Path, marker: dict[str, object]) -> None:
             raise AndroidError(
                 f"{destination} belongs to a different backup run or plan "
                 f"({existing.get('backup_id')}). Use a new backup ID or an empty destination.")
-        return
+        return False
     if destination.exists() and any(destination.iterdir()):
         raise AndroidError(
             f"{destination} already contains files that were not created by this backup run "
             "(for example an older backup with a different folder layout). "
             "Use a new backup ID, or move that folder away first.")
+    return True
+
+
+def remaining_bytes(plan: list[dict[str, str]], destination: Path) -> int:
+    """Bytes still to copy: planned files not yet present at their full size."""
+    total = 0
+    for row in plan:
+        target = destination / Path(row["destination_relative_path"])
+        size = int(row["size_bytes"])
+        try:
+            if target.stat().st_size == size:
+                continue
+        except OSError:
+            pass
+        total += size
+    return total
+
+
+def claim_destination(destination: Path, marker: dict[str, object]) -> None:
+    """Check ownership, then write the marker if the folder is new or empty."""
+    if not check_destination(destination, marker):
+        return
     (destination / MARKER_DIRECTORY).mkdir(parents=True, exist_ok=True)
     (destination / MARKER_DIRECTORY / MARKER_FILE).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
 
@@ -708,9 +730,13 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
     if workers < 1:
         raise ValueError("workers must be at least 1")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    required = sum(int(row["size_bytes"]) for row in plan)
-    if shutil.disk_usage(destination.parent).free < required:
-        raise AndroidError(f"Insufficient destination space for {required:,} planned bytes.")
+    if marker is not None:
+        check_destination(destination, marker)  # refuse foreign folders before anything else
+    required = remaining_bytes(plan, destination)
+    free = shutil.disk_usage(destination.parent).free
+    if free < required:
+        raise AndroidError(f"Insufficient destination space: {required:,} bytes still to copy, "
+                           f"{free:,} bytes free on the destination drive.")
     if marker is not None:
         claim_destination(destination, marker)
     for folder in ("media", "documents"):

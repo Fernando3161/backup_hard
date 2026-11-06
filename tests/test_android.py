@@ -927,5 +927,56 @@ class DestinationMarkerTests(unittest.TestCase):
             self.assertEqual(issues, ["destination_marker_missing"])
 
 
+class FreeSpaceTests(unittest.TestCase):
+    def _marker(self, root):
+        from backup_hard.android import run_marker
+        plan_path = root / "plan.csv"
+        plan_path.write_text("plan", encoding="utf-8")
+        return run_marker("phone_20260802", "S", plan_path)
+
+    def _tiny_disk(self, free):
+        import shutil as _shutil
+        return patch("backup_hard.android.shutil.disk_usage", return_value=_shutil._ntuple_diskusage(10**12, 10**12 - free, free))
+
+    def test_foreign_folder_refusal_comes_before_space_check(self):
+        data = b"f" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "backup" / "media").mkdir(parents=True)
+            (root / "backup" / "media" / "old.jpg").write_bytes(b"old")
+            with self._tiny_disk(0), self.assertRaisesRegex(AndroidError, "not created by this backup run"):
+                copy_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports", 1,
+                          marker=self._marker(root))
+
+    def test_space_check_counts_only_files_still_to_copy(self):
+        from backup_hard.android import remaining_bytes
+        files = {f"/storage/emulated/0/DCIM/s{index}.jpg": b"s" * (10240 + index) for index in range(3)}
+        plan = [plan_row(source=source, destination=f"media/x/s{index}.jpg", data=data)
+                for index, (source, data) in enumerate(files.items())]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = self._marker(root)
+            adb = FileAdb(files)
+            copy_plan(adb, "S", plan[:2], root / "backup", root / "reports", 1, marker=marker)
+            self.assertEqual(remaining_bytes(plan, root / "backup"), 10242)
+            with self._tiny_disk(10242):
+                results, _ = copy_plan(adb, "S", plan, root / "backup", root / "reports", 1, marker=marker)
+            self.assertEqual(sorted(row["status"] for row in results), ["already_complete", "already_complete", "copied"])
+            with self._tiny_disk(0):
+                results, _ = copy_plan(adb, "S", plan, root / "backup", root / "reports", 1, marker=marker)
+            self.assertEqual({row["status"] for row in results}, {"already_complete"})
+
+    def test_not_enough_space_writes_nothing(self):
+        data = b"n" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self._tiny_disk(100), self.assertRaisesRegex(AndroidError, "still to copy"):
+                copy_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports", 1,
+                          marker=self._marker(root))
+            self.assertFalse((root / "backup").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
