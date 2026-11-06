@@ -24,7 +24,32 @@ def _escape_character(character: str) -> str:
     return "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
 
 
+def needs_encoding(name: str) -> bool:
+    """True when Windows would reject or alter the name as written."""
+    stripped = name.rstrip(" .")
+    return (
+        not name or stripped != name
+        or any(character in INVALID - {"%"} or ord(character) < 32 for character in name)
+        or name.split(".", 1)[0].casefold() in RESERVED
+    )
+
+
 def encode_windows_name(name: str, maximum_length: int = 180) -> EncodedName:
+    """Return a Windows-safe file name.
+
+    Names Windows already accepts are kept as they are (only shortened when too
+    long). Otherwise every unsafe character, and `%` itself, is percent-escaped
+    so the result decodes back to the original. The plan always records the
+    original name, so decoding is a convenience, not a requirement.
+    """
+    if not needs_encoding(name):
+        if len(name) <= maximum_length:
+            return EncodedName(name, name)
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        suffix = "~" + digest
+        stem, dot, extension = name.rpartition(".")
+        keep = f"{dot}{extension}" if dot and len(extension) <= 10 else ""
+        return EncodedName(name, name[: maximum_length - len(suffix) - len(keep)] + suffix + keep, True)
     if not name:
         name = "[empty]"
     trailing_start = len(name.rstrip(" ."))
