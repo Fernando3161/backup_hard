@@ -387,10 +387,11 @@ class BatchStatTests(unittest.TestCase):
 class FileFormatsOrderTests(unittest.TestCase):
     def test_file_formats_sorted_by_total_size_descending(self):
         from backup_hard.android import write_inventory
-        rows = [{"extension": ext, "size_bytes": size} for ext, size in
+        rows = [{"extension": ext, "size_bytes": size, "status": "included"} for ext, size in
                 [(".aaa", 5), (".mp4", 900), (".jpg", 300), (".jpg", 400), (".bbb", 5), ("", 50)]]
+        metadata = {"device_label": "phone", "manufacturer": "m", "model": "x", "volumes": []}
         with tempfile.TemporaryDirectory() as tmp:
-            write_inventory(Path(tmp), {}, rows, [])
+            write_inventory(Path(tmp), metadata, rows, [])
             with Path(tmp, "file_formats.csv").open(encoding="utf-8-sig") as handle:
                 order = [row["extension"] for row in csv.DictReader(handle)]
         self.assertEqual(order, [".mp4", ".jpg", "[no extension]", ".aaa", ".bbb"])

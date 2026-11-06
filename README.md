@@ -169,6 +169,7 @@ collision names:
 python -m backup_hard.select_formats \
   --backup-id nokia_x10_1_20260802 --android-media-documents
 ```
+python -m backup_hard.select_formats --backup-id samsung_s25u_20261106 --android-media-documents
 
 Copy to a user-selected root:
 
@@ -177,6 +178,11 @@ python -m backup_hard.copy_backup --source-type android \
   --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
   --destination-root <destination-root> --retries 3
 ```
+python -m backup_hard.copy_backup --source-type android \
+  --backup-id samsung_s25u_20261106 --device-serial RZCY11Z14EV \
+  --destination-root "C:/temp/fall_travel_pics" --retries 3
+
+
 
 The destination is `<destination-root>/nokia_x10_1_20260802/` with `media/`,
 `documents/`, and `metadata/`. Android media uses only this fixed type-based tree:
