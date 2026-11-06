@@ -101,21 +101,35 @@ for video, and 1 KiB for everything else. Caches, thumbnails, trash,
 are skipped. Private app data cannot be read over ADB. Unreadable folders are
 listed in `scan_errors.csv` and the rest of the scan continues.
 
-**How files are arranged.** Documents go in `documents/` by extension. Media is
-sorted into this tree, with `_1`, `_2` suffixes for duplicate names:
+**How files are arranged.** Media is sorted by where it came from, its type,
+and its month. Documents go in `documents/<extension>/`.
 
 ```text
-media/
-├── audio/
-├── video/   camera/  social_media/  other/
-└── photos/  camera/  social_media/  screenshots/  other/
+media/<origin>/<images|videos|audio>/<YYYY_MM>/<file>
+media/whatsapp/images/2026_01/IMG-20260109-WA0018.jpg
+media/camera/images/2026_08/part_002/20260815_101010.jpg
+documents/pdf/report.pdf
 ```
+
+- **Origin** is the app or place, such as `whatsapp`, `telegram`, `camera`,
+  `screenshots`, `downloads`, or a DCIM or Pictures subfolder name. Unmatched
+  files go to `other`. Step 2's report lists the file count per origin.
+- **Month** comes from a date in the file name, else the file's modified date.
+- **No media folder holds more than 100 files.** A busier month is split into
+  `part_001`, `part_002`, and so on, in date order.
+- **Names** are kept as on the phone. Names Windows cannot store are escaped,
+  and duplicates get `_1`, `_2` suffixes. The plan records every original path.
 
 **How it is checked.** Copy and verify compare SHA-256 hashes computed on the
 phone with hashes of the copied files. Verify also rescans the phone and fails
 on new, changed, missing, or extra files. Folders already listed as unreadable
 in Step 1 are reported but do not fail verification. Copy and verify accept
 `--workers N`, which defaults to 4.
+
+**Each backup folder belongs to one run.** Copy writes `.backup-hard/run.json`
+with the backup ID, phone, and plan fingerprint. It resumes only into a folder
+with a matching marker, and refuses any other non-empty folder without touching
+it. Free space is checked only for files still to copy.
 
 To redo Step 2, delete `reports/<backup-id>/step_2/` first.
 
@@ -125,6 +139,9 @@ To redo Step 2, delete `reports/<backup-id>/step_2/` first.
   Rerun Step 3, then Step 4.
 - **Verify reports unexpected files:** the destination holds files outside the
   plan, often from an earlier policy. Use a clean destination.
+- **Copy refuses the destination:** the folder holds another run's files, such
+  as a backup made with an older layout. Use a new `<backup-id>`, or move the
+  old folder away.
 - **Access denied:** check `scan_errors.csv`, then run with the needed
   permissions or exclude that path.
 
