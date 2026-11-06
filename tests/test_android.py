@@ -267,3 +267,130 @@ class ListPathsPermissionTests(unittest.TestCase):
         adb = self._FindAdb(1, b"", b"find: /nope: No such file or directory\n")
         with self.assertRaises(AndroidError):
             _list_paths(adb, "S", "/nope")
+
+
+class BatchStatTests(unittest.TestCase):
+    """The batched size/date lookup that replaces one ADB call per file."""
+
+    class _StdoutAdb:
+        def __init__(self, stdout, returncode=0):
+            self.stdout, self.returncode, self.calls = stdout, returncode, []
+
+        def shell(self, serial, *args, **kwargs):
+            self.calls.append(args)
+            return subprocess.CompletedProcess(args, self.returncode, self.stdout, b"")
+
+    class _LocalShellAdb:
+        """Runs the exact quoted command `adb shell` would send, in a local POSIX shell."""
+
+        def __init__(self, sh):
+            self.sh, self.calls = sh, []
+
+        def shell(self, serial, *args, binary=False, check=True):
+            import shlex
+            self.calls.append(args)
+            command = " ".join(shlex.quote(arg) for arg in args)
+            result = subprocess.run([self.sh, "-c", command], capture_output=True)
+            out, err = result.stdout, result.stderr
+            if not binary:
+                out, err = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+            return subprocess.CompletedProcess(args, result.returncode, out, err)
+
+    def test_parses_sizes_dates_and_pipes_in_names(self):
+        from backup_hard.android import _stat_many
+        adb = self._StdoutAdb(b"10|100|/r/a.jpg\n20|200|/r/odd|name.mp4\n0|5|/r/empty\n")
+        stats = _stat_many(adb, "S", "/r")
+        self.assertEqual(stats, {"/r/a.jpg": (10, 100), "/r/odd|name.mp4": (20, 200), "/r/empty": (0, 5)})
+        self.assertEqual(len(adb.calls), 1)
+        self.assertEqual(adb.calls[0][:2], ("sh", "-c"))
+        self.assertIn("xargs -0", adb.calls[0][2])
+        self.assertEqual(adb.calls[0][3:], ("sh", "/r"))
+
+    def test_crlf_line_endings_from_device(self):
+        from backup_hard.android import _stat_many
+        adb = self._StdoutAdb(b"21901912|1751332827|/r/Music/song.m4a\r\n5|6|/r/b\r\n")
+        self.assertEqual(_stat_many(adb, "S", "/r"), {"/r/Music/song.m4a": (21901912, 1751332827), "/r/b": (5, 6)})
+
+    def test_newline_names_and_duplicates_are_left_out(self):
+        from backup_hard.android import _stat_many
+        # "/r/a\nb" spills onto two lines; its first half collides with a real "/r/a".
+        adb = self._StdoutAdb(b"1|1|/r/a\n9|9|/r/a\nb\n3|3|/r/c\ngarbage\n")
+        self.assertEqual(_stat_many(adb, "S", "/r"), {"/r/c": (3, 3)})
+
+    def test_failure_returns_empty_mapping(self):
+        from backup_hard.android import _stat_many
+        self.assertEqual(_stat_many(self._StdoutAdb(b"", returncode=1), "S", "/r"), {})
+
+    def test_inventory_uses_batch_and_falls_back_per_file(self):
+        from backup_hard import android
+        listing = b"/r/DCIM/a.jpg\0/r/DCIM/b.jpg\0/r/Music/c.mp3\0"
+        stats = b"20000|100|/r/DCIM/a.jpg\n30000|200|/r/Music/c.mp3\n"  # b.jpg missing -> fallback
+        calls = []
+
+        class Adb:
+            def shell(self, serial, *args, **kwargs):
+                calls.append(args)
+                if "-print0" in args:
+                    return subprocess.CompletedProcess(args, 0, listing, b"")
+                if args[0] == "sh":
+                    return subprocess.CompletedProcess(args, 0, stats, b"")
+                if args[0] == "stat":
+                    return subprocess.CompletedProcess(args, 0, "40000|300\n", "")
+                raise AssertionError(args)
+
+        with patch.object(android, "select_device", return_value=Device("S", "device", {})), \
+             patch.object(android, "discover_volumes", return_value=([Volume("internal", "/r", "internal")], [])), \
+             patch.object(android, "_prop", return_value="x"):
+            _, rows, errors = android.inventory_device(Adb(), None, "phone")
+        by_path = {row["source_path"]: (row["size_bytes"], row["mtime"]) for row in rows}
+        self.assertEqual(by_path, {"/r/DCIM/a.jpg": (20000, 100), "/r/DCIM/b.jpg": (40000, 300), "/r/Music/c.mp3": (30000, 200)})
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(1 for args in calls if args[0] == "stat"), 1)
+
+    def test_real_shell_matches_per_file_stat(self):
+        import shutil
+        from backup_hard.android import _list_paths, _stat, _stat_many
+        sh = shutil.which("sh")
+        if not sh or not shutil.which("find", path=str(Path(sh).parent)):
+            self.skipTest("no POSIX sh with find/stat available")
+        adb = self._LocalShellAdb(sh)
+        names = ["plain.jpg", "with space.mp4", "it's quoted.png", "$dollar & amp.txt", "ümlaut ñ 写真.jpg", "[brackets] (1).heic"]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, name in enumerate(names):
+                sub = Path(tmp, "sub dir" if index % 2 else "", name)
+                sub.parent.mkdir(exist_ok=True)
+                sub.write_bytes(b"x" * (index * 1000 + 7))
+            root = Path(tmp).as_posix()
+            paths, errors = _list_paths(adb, "S", root)
+            stats = _stat_many(adb, "S", root)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(paths), len(names))
+            self.assertEqual(set(stats), set(paths))
+            for path in paths:
+                self.assertEqual(stats[path], _stat(adb, "S", path), path)
+
+    def test_real_shell_spans_multiple_chunks(self):
+        import shutil
+        from backup_hard import android
+        sh = shutil.which("sh")
+        if not sh or not shutil.which("xargs", path=str(Path(sh).parent)):
+            self.skipTest("no POSIX sh with find/xargs/stat available")
+        count = android.STAT_BATCH_SIZE * 2 + 37
+        with tempfile.TemporaryDirectory() as tmp:
+            for index in range(count):
+                Path(tmp, f"f {index:05d}.jpg").write_bytes(b"x" * (index % 50))
+            stats = android._stat_many(self._LocalShellAdb(sh), "S", Path(tmp).as_posix())
+        self.assertEqual(len(stats), count)
+        self.assertEqual(stats[f"{Path(tmp).as_posix()}/f 00049.jpg"][0], 49)
+
+
+class FileFormatsOrderTests(unittest.TestCase):
+    def test_file_formats_sorted_by_total_size_descending(self):
+        from backup_hard.android import write_inventory
+        rows = [{"extension": ext, "size_bytes": size} for ext, size in
+                [(".aaa", 5), (".mp4", 900), (".jpg", 300), (".jpg", 400), (".bbb", 5), ("", 50)]]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_inventory(Path(tmp), {}, rows, [])
+            with Path(tmp, "file_formats.csv").open(encoding="utf-8-sig") as handle:
+                order = [row["extension"] for row in csv.DictReader(handle)]
+        self.assertEqual(order, [".mp4", ".jpg", "[no extension]", ".aaa", ".bbb"])

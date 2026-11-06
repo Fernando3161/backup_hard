@@ -238,6 +238,40 @@ def _stat(adb: Adb, serial: str, path: str) -> tuple[int, int]:
     return int(size), int(mtime)
 
 
+STAT_BATCH_FORMAT = "%s|%Y|%n"
+STAT_BATCH_SIZE = 500
+
+
+def _stat_many(adb: Adb, serial: str, root: str) -> dict[str, tuple[int, int]]:
+    """Return {path: (size, mtime)} for every readable file under root in one ADB call.
+
+    One `find | xargs stat` pipeline on the device replaces one ADB round trip
+    per file. Output is newline-delimited
+    with the name last, so `|` in names is safe, and a trailing CR is dropped. A name containing a newline
+    cannot be parsed reliably; such paths, and any name seen twice, are left out
+    so the caller falls back to a per-file stat for them.
+    """
+    # Toybox `find -exec ... {} +` overflows the argument limit on large trees
+    # ("Argument list too long"), so chunk through xargs instead. The root is
+    # passed as $1, never spliced into the script.
+    script = f'find "$1" -type f -print0 | xargs -0 -n {STAT_BATCH_SIZE} stat -c "{STAT_BATCH_FORMAT}"'
+    result = adb.shell(serial, "sh", "-c", script, "sh", root, binary=True, check=False)
+    stats: dict[str, tuple[int, int]] = {}
+    ambiguous: set[str] = set()
+    for line in (result.stdout or b"").split(b"\n"):
+        # Real devices were observed returning CRLF line endings over adb shell.
+        parts = line.rstrip(b"\r").split(b"|", 2)
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].lstrip(b"-").isdigit() or not parts[2]:
+            continue
+        name = parts[2].decode("utf-8", errors="surrogateescape")
+        if name in stats:
+            ambiguous.add(name)
+        stats[name] = (int(parts[0]), int(parts[1]))
+    for name in ambiguous:
+        del stats[name]
+    return stats
+
+
 def inventory_device(adb: Adb, serial: str | None, label: str) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, str]]]:
     device = select_device(adb, serial)
     serial = device.serial
@@ -252,11 +286,16 @@ def inventory_device(adb: Adb, serial: str | None, label: str) -> tuple[dict[str
         except AndroidError as exc:
             errors.append({"path": volume.root, "operation": "scan volume", "error": str(exc)})
             continue
+        try:
+            batch_stats = _stat_many(adb, serial, volume.root)
+        except AndroidError:
+            batch_stats = {}
         for source_path in sorted(paths, key=str.casefold):
             relative = source_path[len(volume.root):].lstrip("/")
             extension = PurePosixPath(relative).suffix.casefold()
             try:
-                size, mtime = _stat(adb, serial, source_path)
+                cached = batch_stats.get(source_path)
+                size, mtime = cached if cached is not None else _stat(adb, serial, source_path)
                 category = classify(extension)
                 reason = exclusion_reason(relative, extension, category, size)
                 status = "excluded" if reason else "included"
@@ -294,7 +333,7 @@ def write_inventory(output: Path, metadata: dict[str, object], rows: list[dict[s
         item[1] += int(row["size_bytes"])
     _write_csv(output / "file_formats.csv", ["extension", "file_count", "total_size_bytes", "total_size_mib", "total_size_gib"], [
         {"extension": ext, "file_count": values[0], "total_size_bytes": values[1], "total_size_mib": f"{values[1]/1024**2:.3f}", "total_size_gib": f"{values[1]/1024**3:.6f}"}
-        for ext, values in sorted(totals.items())
+        for ext, values in sorted(totals.items(), key=lambda pair: (-pair[1][1], pair[0]))
     ])
     (output / "device.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     included = [row for row in rows if row["status"] == "included"]
