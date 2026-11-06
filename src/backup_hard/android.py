@@ -110,11 +110,11 @@ class Adb:
             devices.append(Device(fields[0], fields[1], details))
         return devices
 
-    def shell(self, serial: str, *args: str, binary: bool = False) -> subprocess.CompletedProcess:
+    def shell(self, serial: str, *args: str, binary: bool = False, check: bool = True) -> subprocess.CompletedProcess:
         # `adb shell` concatenates argv into a remote shell command. Quote every
         # token explicitly so metacharacters and user filenames remain data.
         command = " ".join(shlex.quote(arg) for arg in args)
-        return self.run(["-s", serial, "shell", command], binary=binary)
+        return self.run(["-s", serial, "shell", command], binary=binary, check=check)
 
     def pull(self, serial: str, source: str, destination: Path) -> None:
         self.run(["-s", serial, "pull", source, str(destination)])
@@ -205,9 +205,31 @@ def exclusion_reason(relative_path: str, extension: str, category: str | None, s
     return None
 
 
-def _list_paths(adb: Adb, serial: str, root: str) -> list[str]:
-    result = adb.shell(serial, "find", root, "-type", "f", "-print0", binary=True)
-    return [item.decode("utf-8", errors="surrogateescape") for item in result.stdout.split(b"\0") if item]
+def _list_paths(adb: Adb, serial: str, root: str) -> tuple[list[str], list[dict[str, str]]]:
+    """List files under root, tolerating unreadable subdirectories.
+
+    Android 11+ denies ADB access to other apps' folders under Android/data and
+    Android/obb. `find` then exits non-zero but still prints everything it could
+    read, so keep that output and report each denied path separately.
+    """
+    result = adb.shell(serial, "find", root, "-type", "f", "-print0", binary=True, check=False)
+    paths = [item.decode("utf-8", errors="surrogateescape") for item in (result.stdout or b"").split(b"\0") if item]
+    stderr = result.stderr or b""
+    stderr = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
+    errors: list[dict[str, str]] = []
+    unexpected: list[str] = []
+    for line in stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("find: ") and line.endswith("Permission denied"):
+            denied = line[len("find: "):].rsplit(":", 1)[0].strip()
+            errors.append({"path": denied, "operation": "scan directory", "error": "Permission denied (skipped)"})
+        else:
+            unexpected.append(line)
+    if result.returncode and (unexpected or not paths):
+        raise AndroidError(f"ADB command failed: {'; '.join(unexpected) or 'no diagnostic returned'}")
+    return paths, errors
 
 
 def _stat(adb: Adb, serial: str, path: str) -> tuple[int, int]:
@@ -225,7 +247,8 @@ def inventory_device(adb: Adb, serial: str | None, label: str) -> tuple[dict[str
     rows: list[dict[str, object]] = []
     for volume in volumes:
         try:
-            paths = _list_paths(adb, serial, volume.root)
+            paths, scan_errors = _list_paths(adb, serial, volume.root)
+            errors.extend(scan_errors)
         except AndroidError as exc:
             errors.append({"path": volume.root, "operation": "scan volume", "error": str(exc)})
             continue

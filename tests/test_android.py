@@ -241,3 +241,29 @@ class AndroidTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListPathsPermissionTests(unittest.TestCase):
+    class _FindAdb:
+        def __init__(self, returncode, stdout, stderr):
+            self.result = (returncode, stdout, stderr)
+
+        def shell(self, serial, *args, **kwargs):
+            code, out, err = self.result
+            return subprocess.CompletedProcess(args, code, out, err)
+
+    def test_denied_subfolder_keeps_partial_listing(self):
+        from backup_hard.android import _list_paths
+        adb = self._FindAdb(
+            1, b"/storage/emulated/0/DCIM/a.jpg\0/storage/emulated/0/Music/b.mp3\0",
+            b"find: /storage/emulated/0/Android/data/com.yoosee/files: Permission denied\n",
+        )
+        paths, errors = _list_paths(adb, "S", "/storage/emulated/0")
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(errors[0]["path"], "/storage/emulated/0/Android/data/com.yoosee/files")
+
+    def test_other_failures_still_raise(self):
+        from backup_hard.android import _list_paths
+        adb = self._FindAdb(1, b"", b"find: /nope: No such file or directory\n")
+        with self.assertRaises(AndroidError):
+            _list_paths(adb, "S", "/nope")
