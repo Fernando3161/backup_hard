@@ -475,6 +475,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--destination-root", type=Path, required=True)
     parser.add_argument("--reports-root", type=Path, default=Path("reports"))
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel ADB pulls for --source-type android (default 4)")
     return parser.parse_args()
 
 
@@ -482,6 +484,9 @@ def main() -> int:
     args = parse_args()
     if args.retries < 1:
         print("Backup failed: --retries must be at least 1", file=sys.stderr)
+        return 2
+    if args.workers < 1:
+        print("Backup failed: --workers must be at least 1", file=sys.stderr)
         return 2
     try:
         if args.source_type == "android":

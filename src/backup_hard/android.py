@@ -10,8 +10,10 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -39,6 +41,12 @@ EXCLUDED_DIRECTORY_NAMES = {
 }
 EXCLUDED_FILE_SUFFIXES = {".tmp", ".temp", ".part", ".partial", ".crdownload", ".download"}
 EXCLUDED_PATH_PREFIXES = {"android/data", "android/obb"}
+# Chat sticker caches (small, often animated .webp files with generated names).
+# Matched as whole directory names at any depth, case-insensitively.
+EXCLUDED_STICKER_DIRECTORY_NAMES = {
+    "whatsapp stickers", "whatsapp backup excluded stickers",
+    "whatsapp business stickers", "whatsapp business backup excluded stickers",
+}
 STREAMING_MARKERS = {
     "com.spotify.music/files/spotifycache", "com.netflix.mediaclient", "offline_cache",
     "streaming_cache", "videochunks",
@@ -86,12 +94,13 @@ class Adb:
     def __init__(self, executable: str = "adb") -> None:
         self.executable = executable
 
-    def run(self, args: Sequence[str], *, binary: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+    def run(self, args: Sequence[str], *, binary: bool = False, check: bool = True,
+            input: bytes | None = None) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
                 [self.executable, *args], check=check, capture_output=True,
                 text=not binary, encoding=None if binary else "utf-8",
-                errors=None if binary else "replace", shell=False,
+                errors=None if binary else "replace", shell=False, input=input,
             )
         except FileNotFoundError as exc:
             raise AndroidError("adb was not found. Install Android SDK Platform Tools and add adb to PATH.") from exc
@@ -121,6 +130,18 @@ class Adb:
 
     def stream(self, serial: str, source: str) -> bytes:
         return self.run(["-s", serial, "exec-out", "cat", "--", source], binary=True).stdout
+
+    def sha256_many(self, serial: str, paths: Sequence[str]) -> dict[str, str]:
+        """Hash files on the device in one call; paths go over stdin, never the command line.
+
+        Paths whose output line cannot be parsed unambiguously (for example names
+        containing a newline) are left out, so callers must fall back for them.
+        """
+        if not paths:
+            return {}
+        payload = b"\0".join(path.encode("utf-8", errors="surrogateescape") for path in paths)
+        result = self.run(["-s", serial, "shell", "xargs -0 sha256sum"], binary=True, check=False, input=payload)
+        return _parse_sha256sum(result.stdout or b"", paths)
 
 
 def select_device(adb: Adb, serial: str | None) -> Device:
@@ -193,6 +214,8 @@ def exclusion_reason(relative_path: str, extension: str, category: str | None, s
         return "private application package or expansion data"
     if any(part in EXCLUDED_DIRECTORY_NAMES for part in parts[:-1]):
         return "cache, temporary, thumbnail, trash, or recycle directory"
+    if any(part in EXCLUDED_STICKER_DIRECTORY_NAMES for part in parts[:-1]):
+        return "WhatsApp sticker folder"
     if any(marker in normalized for marker in STREAMING_MARKERS):
         return "known streaming or offline cache"
     if extension in EXCLUDED_FILE_SUFFIXES:
@@ -412,7 +435,8 @@ def create_plan(step1: Path, output: Path, backup_id: str) -> list[dict[str, obj
               "device": metadata, "media_extensions": {k: sorted(v) for k, v in MEDIA_EXTENSIONS.items()},
               "document_extensions": sorted(DOCUMENT_EXTENSIONS), "global_minimum_bytes": GLOBAL_MINIMUM,
               "category_minimum_bytes": CATEGORY_MINIMUMS, "excluded_directory_names": sorted(EXCLUDED_DIRECTORY_NAMES),
-              "excluded_path_prefixes": sorted(EXCLUDED_PATH_PREFIXES), "streaming_markers": sorted(STREAMING_MARKERS),
+              "excluded_path_prefixes": sorted(EXCLUDED_PATH_PREFIXES),
+              "excluded_sticker_directory_names": sorted(EXCLUDED_STICKER_DIRECTORY_NAMES),"streaming_markers": sorted(STREAMING_MARKERS),
               "media_layout": {
                   "audio": ["media/audio"],
                   "video": ["media/video/camera", "media/video/social_media", "media/video/other"],
@@ -450,9 +474,47 @@ def sha256_source(adb: Adb, serial: str, path: str) -> str:
     return hashlib.sha256(adb.stream(serial, path)).hexdigest()
 
 
-def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path, retries: int) -> tuple[list[dict[str, object]], bool]:
+def _parse_sha256sum(stdout: bytes, requested: Sequence[str]) -> dict[str, str]:
+    wanted = set(requested)
+    hashes: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for line in stdout.split(b"\n"):
+        line = line.rstrip(b"\r")  # devices were observed returning CRLF over adb shell
+        # "<hash>  <name>" (text mode, toybox) or "<hash> *<name>" (binary mode, GNU on Windows)
+        if len(line) < 67 or line[64:66] not in (b"  ", b" *"):
+            continue
+        digest = line[:64].decode("ascii", errors="replace").lower()
+        if any(char not in "0123456789abcdef" for char in digest):
+            continue
+        name = line[66:].decode("utf-8", errors="surrogateescape")
+        if name not in wanted:
+            continue
+        if name in hashes:
+            ambiguous.add(name)
+        hashes[name] = digest
+    for name in ambiguous:
+        del hashes[name]
+    return hashes
+
+
+def device_sha256(adb: Adb, serial: str, path: str) -> str:
+    """Fresh hash of one source file: on-device when possible, else streamed and hashed locally."""
+    try:
+        digest = adb.sha256_many(serial, [path]).get(path)
+    except AndroidError:
+        digest = None
+    return digest or sha256_source(adb, serial, path)
+
+
+COPY_HASH_CHUNK = 500
+
+
+def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path, retries: int,
+              workers: int = 4) -> tuple[list[dict[str, object]], bool]:
     if retries < 1:
         raise ValueError("retries must be at least 1")
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
     destination.parent.mkdir(parents=True, exist_ok=True)
     for folder in ("media", "documents", "metadata"):
         (destination / folder).mkdir(parents=True, exist_ok=True)
@@ -462,44 +524,82 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "copy_manifest.csv"
     previous = {row["source_path"]: row for row in read_csv(manifest_path)} if manifest_path.exists() else {}
-    results: list[dict[str, object]] = []
+    slots: list[dict[str, object] | None] = [None] * len(plan)
+    stop = threading.Event()
     interrupted = False
+
+    def copy_row(row: dict[str, str], expected_hash: str | None) -> dict[str, object] | None:
+        target = destination / Path(row["destination_relative_path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            if stop.is_set():
+                return None
+            partial = target.with_name(f".{target.name}.backup-hard-{uuid.uuid4().hex}.partial")
+            try:
+                adb.pull(serial, row["source_path"], partial)
+                if partial.stat().st_size != int(row["size_bytes"]):
+                    raise AndroidError("temporary copy size differs from locked plan")
+                local_hash = sha256_file(partial)
+                # The batch hash was taken just before this chunk; a retry re-hashes
+                # the source fresh in case it changed or the batch missed it.
+                source_hash = expected_hash if attempt == 1 and expected_hash else device_sha256(adb, serial, row["source_path"])
+                if local_hash != source_hash:
+                    raise AndroidError("temporary copy SHA-256 differs from source")
+                if target.exists():
+                    raise AndroidError("destination appeared during copy; refusing overwrite")
+                os.replace(partial, target)
+                return {**row, "status": "copied", "attempts": attempt, "sha256": source_hash, "reason": ""}
+            except (AndroidError, OSError) as exc:
+                last_error = str(exc)
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if stop.is_set():
+                    return None
+        return {**row, "status": "failed", "attempts": retries, "sha256": "", "reason": last_error}
+
+    def hash_chunk(indices: list[int]) -> dict[str, str]:
+        try:
+            return adb.sha256_many(serial, [plan[index]["source_path"] for index in indices])
+        except AndroidError:
+            return {}
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    hasher = ThreadPoolExecutor(max_workers=1)
     try:
-        for row in plan:
+        pending: list[int] = []
+        for index, row in enumerate(plan):
             target = destination / Path(row["destination_relative_path"])
             old = previous.get(row["source_path"])
             if old and old.get("status") in {"copied", "already_complete"} and target.is_file() and target.stat().st_size == int(row["size_bytes"]) and sha256_file(target) == old.get("sha256"):
-                results.append({**row, "status": "already_complete", "attempts": 0, "sha256": old["sha256"], "reason": "manifest and destination hash match"})
-                continue
-            if target.exists():
-                results.append({**row, "status": "failed", "attempts": 0, "sha256": "", "reason": "pre-existing destination was not proven to be this source; not overwritten"})
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            last_error = ""
-            for attempt in range(1, retries + 1):
-                partial = target.with_name(f".{target.name}.backup-hard-{uuid.uuid4().hex}.partial")
-                try:
-                    adb.pull(serial, row["source_path"], partial)
-                    if partial.stat().st_size != int(row["size_bytes"]):
-                        raise AndroidError("temporary copy size differs from locked plan")
-                    source_hash = sha256_source(adb, serial, row["source_path"])
-                    if sha256_file(partial) != source_hash:
-                        raise AndroidError("temporary copy SHA-256 differs from source")
-                    if target.exists():
-                        raise AndroidError("destination appeared during copy; refusing overwrite")
-                    os.replace(partial, target)
-                    results.append({**row, "status": "copied", "attempts": attempt, "sha256": source_hash, "reason": ""})
-                    break
-                except (AndroidError, OSError) as exc:
-                    last_error = str(exc)
-                    try:
-                        partial.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                slots[index] = {**row, "status": "already_complete", "attempts": 0, "sha256": old["sha256"], "reason": "manifest and destination hash match"}
+            elif target.exists():
+                slots[index] = {**row, "status": "failed", "attempts": 0, "sha256": "", "reason": "pre-existing destination was not proven to be this source; not overwritten"}
             else:
-                results.append({**row, "status": "failed", "attempts": retries, "sha256": "", "reason": last_error})
+                pending.append(index)
+        chunks = [pending[start:start + COPY_HASH_CHUNK] for start in range(0, len(pending), COPY_HASH_CHUNK)]
+        next_hashes = hasher.submit(hash_chunk, chunks[0]) if chunks else None
+        for number, chunk in enumerate(chunks):
+            hashes = next_hashes.result()
+            next_hashes = hasher.submit(hash_chunk, chunks[number + 1]) if number + 1 < len(chunks) else None
+            futures = {pool.submit(copy_row, plan[index], hashes.get(plan[index]["source_path"])): index for index in chunk}
+            for future in as_completed(futures):
+                slots[futures[future]] = future.result()
     except KeyboardInterrupt:
         interrupted = True
+        stop.set()
+    finally:
+        while True:
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+                hasher.shutdown(wait=True, cancel_futures=True)
+                break
+            except KeyboardInterrupt:
+                interrupted = True
+                stop.set()
+    results = [row for row in slots if row is not None]
     fields = PLAN_FIELDS + ["status", "attempts", "sha256", "reason"]
     _write_csv(manifest_path, fields, results)
     _write_csv(output / "copy_failures.csv", fields, [row for row in results if row["status"] == "failed"])
@@ -514,9 +614,26 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
 
 def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Path, output: Path,
                 fresh_rows: list[dict[str, object]] | None = None,
-                scan_errors: list[dict[str, str]] | None = None) -> list[dict[str, object]]:
+                scan_errors: list[dict[str, str]] | None = None, workers: int = 4,
+                known_scan_errors: list[dict[str, str]] | None = None) -> list[dict[str, object]]:
+    """Verify the copy against the locked plan.
+
+    `known_scan_errors` are Step 1's scan_errors.csv rows. A fresh "Permission
+    denied" folder that Step 1 already recorded (for example another app's
+    private Android/data folder) was reviewed before the plan was locked, so it
+    is reported as acknowledged instead of failing verification. Any new
+    unreadable folder, or any other scan error, still fails.
+    """
     discrepancies: list[dict[str, object]] = []
     scan_errors = scan_errors or []
+    acknowledged = {(row.get("path"), row.get("operation")) for row in (known_scan_errors or [])
+                    if row.get("operation") == "scan directory" and "Permission denied" in (row.get("error") or "")}
+
+    def is_acknowledged(error: dict[str, str]) -> bool:
+        return (error["path"], error["operation"]) in acknowledged and "Permission denied" in error["error"]
+
+    for error in scan_errors:
+        error["verification"] = "acknowledged in step 1" if is_acknowledged(error) else "new; counted as discrepancy"
     planned_sources = {row["source_path"] for row in plan}
     if fresh_rows is not None:
         for fresh in fresh_rows:
@@ -525,29 +642,74 @@ def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: 
                                       "collision_reason": "", "issue": "source_not_in_locked_plan",
                                       "detail": "fresh in-policy source file appeared after inventory"})
     for error in scan_errors:
+        if is_acknowledged(error):
+            continue
         discrepancies.append({"source_path": error["path"], "destination_relative_path": "",
                               "issue": "source_scan_error", "detail": f"{error['operation']}: {error['error']}"})
     planned_destinations = {Path(row["destination_relative_path"]) for row in plan}
-    for row in plan:
+    # Fresh sizes/dates from the batched re-inventory; per-file stat only for gaps.
+    fresh_stats = {str(fresh["source_path"]): (int(fresh["size_bytes"]), int(fresh["mtime"]))
+                   for fresh in (fresh_rows or []) if fresh.get("status") != "error"}
+    per_row: list[list[dict[str, object]]] = [[] for _ in plan]
+    to_hash: list[int] = []
+    for index, row in enumerate(plan):
         target = destination / Path(row["destination_relative_path"])
+        found = per_row[index]
         try:
-            current_size, current_mtime = _stat(adb, serial, row["source_path"])
+            current_size, current_mtime = fresh_stats.get(row["source_path"]) or _stat(adb, serial, row["source_path"])
         except (AndroidError, ValueError) as exc:
-            discrepancies.append({**row, "issue": "source_inaccessible", "detail": str(exc)})
+            found.append({**row, "issue": "source_inaccessible", "detail": str(exc)})
             continue
         if current_size != int(row["size_bytes"]) or current_mtime != int(row["mtime"]):
-            discrepancies.append({**row, "issue": "source_changed_since_inventory", "detail": f"now size={current_size}, mtime={current_mtime}"})
+            found.append({**row, "issue": "source_changed_since_inventory", "detail": f"now size={current_size}, mtime={current_mtime}"})
         if not target.is_file():
-            discrepancies.append({**row, "issue": "destination_missing", "detail": "planned destination is absent"})
+            found.append({**row, "issue": "destination_missing", "detail": "planned destination is absent"})
             continue
         if target.stat().st_size != current_size:
-            discrepancies.append({**row, "issue": "destination_size_mismatch", "detail": f"destination size={target.stat().st_size}"})
+            found.append({**row, "issue": "destination_size_mismatch", "detail": f"destination size={target.stat().st_size}"})
             continue
+        to_hash.append(index)
+
+    # Content check: the source is hashed on the device itself (batched, no
+    # USB transfer of file bytes) and compared against a fresh local hash of
+    # the destination. Nothing from the Step 3 manifest is trusted.
+    def local_hash(index: int) -> str | Exception:
         try:
-            if sha256_source(adb, serial, row["source_path"]) != sha256_file(target):
-                discrepancies.append({**row, "issue": "content_hash_mismatch", "detail": "source and destination SHA-256 differ"})
-        except (AndroidError, OSError) as exc:
-            discrepancies.append({**row, "issue": "hash_failed", "detail": str(exc)})
+            return sha256_file(destination / Path(plan[index]["destination_relative_path"]))
+        except OSError as exc:
+            return exc
+
+    def device_hashes(indices: list[int]) -> dict[str, str]:
+        try:
+            return adb.sha256_many(serial, [plan[index]["source_path"] for index in indices])
+        except AndroidError:
+            return {}
+
+    chunks = [to_hash[start:start + COPY_HASH_CHUNK] for start in range(0, len(to_hash), COPY_HASH_CHUNK)]
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    hasher = ThreadPoolExecutor(max_workers=1)
+    try:
+        local_futures = {index: pool.submit(local_hash, index) for index in to_hash}
+        next_batch = hasher.submit(device_hashes, chunks[0]) if chunks else None
+        for number, chunk in enumerate(chunks):
+            source_hashes = next_batch.result()
+            next_batch = hasher.submit(device_hashes, chunks[number + 1]) if number + 1 < len(chunks) else None
+            for index in chunk:
+                row = plan[index]
+                destination_hash = local_futures[index].result()
+                try:
+                    if isinstance(destination_hash, Exception):
+                        raise destination_hash
+                    source_hash = source_hashes.get(row["source_path"]) or device_sha256(adb, serial, row["source_path"])
+                    if source_hash != destination_hash:
+                        per_row[index].append({**row, "issue": "content_hash_mismatch", "detail": "source and destination SHA-256 differ"})
+                except (AndroidError, OSError) as exc:
+                    per_row[index].append({**row, "issue": "hash_failed", "detail": str(exc)})
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        hasher.shutdown(wait=True, cancel_futures=True)
+    for found in per_row:
+        discrepancies.extend(found)
     if destination.exists():
         for path in destination.rglob("*"):
             if path.is_file() and path.relative_to(destination) not in planned_destinations:
@@ -555,12 +717,16 @@ def verify_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: 
     output.mkdir(parents=True, exist_ok=True)
     fields = PLAN_FIELDS + ["issue", "detail"]
     _write_csv(output / "validation_discrepancies.csv", fields, discrepancies)
-    _write_csv(output / "validation_scan_errors.csv", ["path", "operation", "error"], scan_errors)
+    _write_csv(output / "validation_scan_errors.csv", ["path", "operation", "error", "verification"], scan_errors)
     passed = not discrepancies
-    (output / "validation_report.md").write_text(
-        f"# Step 4 — Independent Android verification\n\n> Status: **{'PASS' if passed else 'FAIL'}**\n\n- Planned files: **{len(plan):,}**\n- Discrepancies: **{len(discrepancies):,}**\n- Content verification: **SHA-256 streamed fresh from the device and hashed locally**\n",
-        encoding="utf-8",
-    )
+    known = [error for error in scan_errors if is_acknowledged(error)]
+    report = (f"# Step 4 — Independent Android verification\n\n> Status: **{'PASS' if passed else 'FAIL'}**\n\n"
+              f"- Planned files: **{len(plan):,}**\n- Discrepancies: **{len(discrepancies):,}**\n"
+              f"- Known inaccessible folders (recorded in Step 1, not counted): **{len(known):,}**\n"
+              "- Content verification: **SHA-256 computed fresh on the device, compared with a fresh local SHA-256 of each destination file**\n")
+    if known:
+        report += "\n## Acknowledged inaccessible folders\n\n" + "".join(f"- `{error['path']}`\n" for error in known)
+    (output / "validation_report.md").write_text(report, encoding="utf-8")
     return discrepancies
 
 
@@ -583,7 +749,7 @@ def copy_main(args: object) -> int:
     if policy["device"]["serial"] != args.device_serial:
         raise AndroidError("Selected serial differs from the device locked in Step 2.")
     plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
-    _, interrupted = copy_plan(Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 3), args.retries)
+    _, interrupted = copy_plan(Adb(), args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 3), args.retries, getattr(args, "workers", 4))
     return 130 if interrupted else 0
 
 
@@ -595,6 +761,9 @@ def verify_main(args: object) -> int:
     adb = Adb()
     select_device(adb, args.device_serial)
     plan = read_csv(step_directory(args.reports_root, backup_id, 2) / "android_plan.csv")
+    step1_errors_path = step_directory(args.reports_root, backup_id, 1) / "scan_errors.csv"
+    known_scan_errors = read_csv(step1_errors_path) if step1_errors_path.exists() else []
     _, fresh_rows, scan_errors = inventory_device(adb, args.device_serial, policy["device"]["device_label"])
-    discrepancies = verify_plan(adb, args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 4), fresh_rows, scan_errors)
+    discrepancies = verify_plan(adb, args.device_serial, plan, destination_directory_android(args.destination_root, backup_id), step_directory(args.reports_root, backup_id, 4), fresh_rows, scan_errors,
+                                getattr(args, "workers", 4), known_scan_errors)
     return 1 if discrepancies else 0

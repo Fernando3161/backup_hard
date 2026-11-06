@@ -325,6 +325,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backup-id", required=True, help="source_label_YYYYMMDD")
     parser.add_argument("--destination-root", type=Path, required=True)
     parser.add_argument("--reports-root", type=Path, default=Path("reports"))
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel local hashing threads for --source-type android (default 4)")
     return parser.parse_args()
 
 
@@ -332,6 +334,8 @@ def main() -> int:
     args = parse_args()
     started = datetime.now(timezone.utc).astimezone()
     try:
+        if args.workers < 1:
+            raise ValueError("--workers must be at least 1")
         if args.source_type == "android":
             if not args.device_serial:
                 raise ValueError("Android verification requires --device-serial")

@@ -78,8 +78,10 @@ text, and e-books. Matching is case-insensitive. Exact minimums are:
 
 Files exactly at a threshold are included. Android mode excludes unsupported
 types, temporary/incomplete downloads, cache/thumbnail/trash directories,
-`Android/data`, `Android/obb`, package/expansion data, and known offline
-streaming caches. It never uses root, installs software, deletes source data,
+`Android/data`, `Android/obb`, package/expansion data, known offline
+streaming caches, and WhatsApp sticker folders (`WhatsApp Stickers`,
+`WhatsApp Backup Excluded Stickers`, and the WhatsApp Business equivalents).
+It never uses root, installs software, deletes source data,
 or prunes destinations.
 
 Android scoped storage limits what ADB can read. Private app data, Samsung
@@ -178,6 +180,11 @@ python -m backup_hard.copy_backup --source-type android \
   --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
   --destination-root <destination-root> --retries 3
 ```
+
+Android copies run 4 ADB pulls in parallel (`--workers N` to change). Source
+SHA-256 hashes are computed on the device in batches instead of streaming every
+file a second time; a retry re-hashes that one source fresh.
+
 python -m backup_hard.copy_backup --source-type android \
   --backup-id samsung_s25u_20261106 --device-serial RZCY11Z14EV \
   --destination-root "C:/temp/fall_travel_pics" --retries 3
@@ -211,10 +218,14 @@ extension. All mappings are frozen in Step 2, so reruns reuse the same names and
 unrelated files are never overwritten.
 
 ```shell
+python -m backup_hard.verify_backup --source-type android --backup-id samsung_s25u_20261106 --device-serial RZCY11Z14EV --destination-root "C:/temp/fall_travel_pics"
+```
+
 python -m backup_hard.verify_backup --source-type android \
   --backup-id nokia_x10_1_20260802 --device-serial <adb-serial> \
   --destination-root <destination-root>
 ```
+
 
 Step 4 performs a fresh full scan and fresh source-to-destination SHA-256 checks.
 It fails nonzero for inaccessible/new/changed sources, missing or unexpected

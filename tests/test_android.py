@@ -49,6 +49,9 @@ class FileAdb:
     def stream(self, serial, source):
         return self.files[source]
 
+    def sha256_many(self, serial, paths):
+        return {path: hashlib.sha256(self.files[path]).hexdigest() for path in paths if path in self.files}
+
     def shell(self, serial, *args, **kwargs):
         path = args[-1]
         data = self.files[path]
@@ -127,6 +130,20 @@ class AndroidTests(unittest.TestCase):
         volumes, errors = discover_volumes(CommandAdb(responses), "one")
         self.assertEqual([v.label for v in volumes], ["internal", "sd_card"])
         self.assertFalse(errors)
+
+    def test_whatsapp_sticker_folders_are_excluded(self):
+        media = "Android/media/com.whatsapp/WhatsApp/Media/"
+        for path in [
+            media + "WhatsApp Stickers/STK-20260101-WA0001.webp",
+            media + "WhatsApp Backup Excluded Stickers/+dfg1Zkz+rOLVFewwmm0-JnMdcYwluZkId59JKJGw0k=.webp",
+            "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers/STK-1.webp",
+            "WhatsApp/Media/WHATSAPP STICKERS/STK-2.webp",  # legacy root location, any case
+        ]:
+            self.assertEqual(exclusion_reason(path, ".webp", "image", 500000), "WhatsApp sticker folder", path)
+        # Real photos and other webp files are untouched.
+        self.assertIsNone(exclusion_reason(media + "WhatsApp Images/IMG-20260101-WA0001.jpg", ".jpg", "image", 50000))
+        self.assertIsNone(exclusion_reason("Download/img-20260416-wa0049.webp", ".webp", "image", 50000))
+        self.assertIsNone(exclusion_reason("Pictures/WhatsApp Stickers.webp", ".webp", "image", 50000))
 
     def test_classification_paths_case_and_threshold_boundaries(self):
         self.assertEqual(classify(".JPG".casefold()), "image")
@@ -238,9 +255,6 @@ class AndroidTests(unittest.TestCase):
             discrepancies = verify_plan(FileAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports")
             self.assertIn("source_changed_since_inventory", {r["issue"] for r in discrepancies})
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ListPathsPermissionTests(unittest.TestCase):
@@ -395,3 +409,313 @@ class FileFormatsOrderTests(unittest.TestCase):
             with Path(tmp, "file_formats.csv").open(encoding="utf-8-sig") as handle:
                 order = [row["extension"] for row in csv.DictReader(handle)]
         self.assertEqual(order, [".mp4", ".jpg", "[no extension]", ".aaa", ".bbb"])
+
+
+class FastCopyTests(unittest.TestCase):
+    """Step 3: on-device batch hashing plus parallel pulls."""
+
+    def _plan(self, files):
+        return [plan_row(source=source, destination=f"media/other/{Path(source).name}", data=data)
+                for source, data in files.items()]
+
+    def test_parse_sha256sum_output(self):
+        from backup_hard.android import _parse_sha256sum
+        a, b = "a" * 64, "B" * 64
+        stdout = (f"{a}  /r/x y.jpg\r\n{b}  /r/odd  name\r\n{a}  /r/dup\n{a}  /r/dup\n"
+                  f"sha256sum: /r/gone: No such file\nzz{a[2:]}  /r/bad\n{a}  /r/not-asked\n").encode()
+        got = _parse_sha256sum(stdout, ["/r/x y.jpg", "/r/odd  name", "/r/dup", "/r/bad", "/r/gone"])
+        self.assertEqual(got, {"/r/x y.jpg": a, "/r/odd  name": "b" * 64})
+
+    def test_parallel_chunks_copy_everything_without_streaming(self):
+        from backup_hard import android
+        files = {f"/storage/emulated/0/DCIM/f{index:03d}.jpg": bytes([index % 251]) * (10240 + index) for index in range(23)}
+
+        class CountingAdb(FileAdb):
+            def __init__(self, files):
+                super().__init__(files)
+                self.batches, self.streams = [], 0
+
+            def sha256_many(self, serial, paths):
+                self.batches.append(len(paths))
+                return super().sha256_many(serial, paths)
+
+            def stream(self, serial, source):
+                self.streams += 1
+                return super().stream(serial, source)
+
+        adb = CountingAdb(files)
+        with tempfile.TemporaryDirectory() as temp, patch.object(android, "COPY_HASH_CHUNK", 5):
+            root = Path(temp)
+            results, interrupted = copy_plan(adb, "SERIAL_A", self._plan(files), root / "backup", root / "reports", 2, workers=4)
+            self.assertFalse(interrupted)
+            self.assertEqual([row["source_path"] for row in results], list(files))  # plan order kept
+            self.assertTrue(all(row["status"] == "copied" and row["attempts"] == 1 for row in results))
+            for row in results:
+                copied = (root / "backup" / row["destination_relative_path"]).read_bytes()
+                self.assertEqual(copied, files[row["source_path"]])
+                self.assertEqual(row["sha256"], hashlib.sha256(copied).hexdigest())
+            self.assertEqual(adb.batches, [5, 5, 5, 5, 3])
+            self.assertEqual(adb.streams, 0)
+            self.assertFalse(list((root / "backup").rglob("*.partial")))
+            with (root / "reports" / "copy_manifest.csv").open(encoding="utf-8-sig") as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 23)
+
+    def test_stale_batch_hash_is_rechecked_fresh_on_retry(self):
+        data = b"n" * 10240
+        row = plan_row(data=data)
+
+        class StaleAdb(FileAdb):
+            calls = 0
+
+            def sha256_many(self, serial, paths):
+                StaleAdb.calls += 1
+                if StaleAdb.calls == 1:  # batch hash taken before the file changed
+                    return {path: "0" * 64 for path in paths}
+                return super().sha256_many(serial, paths)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            results, _ = copy_plan(StaleAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports", 3)
+        self.assertEqual((results[0]["status"], results[0]["attempts"]), ("copied", 2))
+
+    def test_unparsable_name_falls_back_to_streamed_hash(self):
+        data = b"q" * 10240
+        row = plan_row(data=data)
+
+        class NoBatchAdb(FileAdb):
+            def sha256_many(self, serial, paths):
+                return {}
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            results, _ = copy_plan(NoBatchAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports", 1)
+        self.assertEqual(results[0]["status"], "copied")
+        self.assertEqual(results[0]["sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_wrong_bytes_never_reach_destination(self):
+        data = b"g" * 10240
+        row = plan_row(data=data)
+
+        class CorruptPullAdb(FileAdb):
+            def pull(self, serial, source, destination):
+                destination.write_bytes(b"h" * len(self.files[source]))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            results, _ = copy_plan(CorruptPullAdb({row["source_path"]: data}), "SERIAL_A", [row], root / "backup", root / "reports", 3)
+            self.assertEqual((results[0]["status"], results[0]["attempts"]), ("failed", 3))
+            self.assertFalse([path for path in (root / "backup").rglob("*") if path.is_file()])
+
+    def test_ctrl_c_stops_cleanly_and_resume_finishes(self):
+        files = {f"/storage/emulated/0/DCIM/c{index:02d}.jpg": b"c" * (10240 + index) for index in range(12)}
+        plan = self._plan(files)
+
+        class InterruptingAdb(FileAdb):
+            interrupt = True
+
+            def pull(self, serial, source, destination):
+                if self.interrupt and source.endswith("c05.jpg"):
+                    raise KeyboardInterrupt
+                super().pull(serial, source, destination)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adb = InterruptingAdb(files)
+            # One worker so the interrupt propagates deterministically through future.result().
+            results, interrupted = copy_plan(adb, "SERIAL_A", plan, root / "backup", root / "reports", 2, workers=1)
+            self.assertTrue(interrupted)
+            self.assertLess(len(results), 12)
+            self.assertFalse(list((root / "backup").rglob("*.partial")))
+            adb.interrupt = False
+            results, interrupted = copy_plan(adb, "SERIAL_A", plan, root / "backup", root / "reports", 2)
+            self.assertFalse(interrupted)
+            self.assertEqual(len(results), 12)
+            self.assertTrue(all(row["status"] in {"copied", "already_complete"} for row in results))
+            self.assertIn("already_complete", {row["status"] for row in results})
+
+    def test_real_adb_class_end_to_end_with_local_shell(self):
+        import shutil
+        import sys
+        sh = shutil.which("sh")
+        if not sh or not shutil.which("sha256sum", path=str(Path(sh).parent)):
+            self.skipTest("no POSIX sh with xargs/sha256sum available")
+        shim = Path(__file__).with_name("fake_adb_shim.py")
+
+        class ShimAdb(Adb):
+            def run(self, args, **kwargs):
+                return super().run([str(shim), *args], **kwargs)
+
+        adb = ShimAdb(sys.executable)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            src = root / "phone"
+            src.mkdir()
+            names = ["plain.jpg", "with space.mp4", "it's.png", "$x & y.heic", "ümlaut 写真.jpg", "[b] (1).jpg"]
+            files = {}
+            for index, name in enumerate(names):
+                (src / name).write_bytes(bytes([index]) * (20000 + index * 777))
+                files[(src / name).as_posix()] = (src / name).read_bytes()
+            self.assertEqual(adb.sha256_many("S", list(files)),
+                             {path: hashlib.sha256(data).hexdigest() for path, data in files.items()})
+            results, interrupted = copy_plan(adb, "S", self._plan(files), root / "backup", root / "reports", 2, workers=3)
+            self.assertFalse(interrupted)
+            self.assertEqual([row["status"] for row in results], ["copied"] * len(names))
+            for row in results:
+                self.assertEqual((root / "backup" / row["destination_relative_path"]).read_bytes(), files[row["source_path"]])
+
+
+class FastVerifyTests(unittest.TestCase):
+    """Step 4: fresh-inventory stats plus on-device batch hashes."""
+
+    def _setup(self, root, files, corrupt=()):
+        plan = []
+        for source, data in files.items():
+            row = plan_row(source=source, destination=f"media/other/{Path(source).name}", data=data)
+            target = root / "backup" / row["destination_relative_path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"!" * len(data) if source in corrupt else data)
+            plan.append(row)
+        fresh = [{**row, "size_bytes": int(row["size_bytes"]), "mtime": int(row["mtime"]), "status": "included"} for row in plan]
+        return plan, fresh
+
+    class CountingAdb(FileAdb):
+        def __init__(self, files):
+            super().__init__(files)
+            self.batches, self.streams, self.stats = [], 0, 0
+
+        def sha256_many(self, serial, paths):
+            self.batches.append(len(paths))
+            return super().sha256_many(serial, paths)
+
+        def stream(self, serial, source):
+            self.streams += 1
+            return super().stream(serial, source)
+
+        def shell(self, serial, *args, **kwargs):
+            self.stats += 1
+            return super().shell(serial, *args, **kwargs)
+
+    def test_clean_backup_passes_without_per_file_calls(self):
+        from backup_hard import android
+        files = {f"/storage/emulated/0/DCIM/v{index:02d}.jpg": bytes([index]) * (10240 + index) for index in range(13)}
+        with tempfile.TemporaryDirectory() as temp, patch.object(android, "COPY_HASH_CHUNK", 4):
+            root = Path(temp)
+            plan, fresh = self._setup(root, files)
+            adb = self.CountingAdb(files)
+            discrepancies = verify_plan(adb, "S", plan, root / "backup", root / "reports", fresh, [], workers=3)
+            self.assertEqual(discrepancies, [])
+            self.assertEqual((adb.batches, adb.streams, adb.stats), ([4, 4, 4, 1], 0, 0))
+            self.assertIn("PASS", (root / "reports" / "validation_report.md").read_text(encoding="utf-8"))
+
+    def test_mismatches_reported_in_plan_order(self):
+        files = {f"/storage/emulated/0/DCIM/m{index:02d}.jpg": b"m" * (10240 + index) for index in range(6)}
+        bad = {"/storage/emulated/0/DCIM/m04.jpg", "/storage/emulated/0/DCIM/m01.jpg"}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan, fresh = self._setup(root, files, corrupt=bad)
+            discrepancies = verify_plan(self.CountingAdb(files), "S", plan, root / "backup", root / "reports", fresh, [])
+        self.assertEqual([(d["source_path"][-7:], d["issue"]) for d in discrepancies],
+                         [("m01.jpg", "content_hash_mismatch"), ("m04.jpg", "content_hash_mismatch")])
+
+    def test_gaps_fall_back_to_stat_and_streamed_hash(self):
+        files = {"/storage/emulated/0/DCIM/g.jpg": b"g" * 10240}
+
+        class NoBatchAdb(self.CountingAdb):
+            def sha256_many(self, serial, paths):
+                return {}
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan, _ = self._setup(root, files)
+            adb = NoBatchAdb(files)
+            discrepancies = verify_plan(adb, "S", plan, root / "backup", root / "reports", [], [])
+        self.assertEqual(discrepancies, [])
+        self.assertEqual((adb.stats, adb.streams), (1, 1))
+
+    def test_source_changed_detected_from_fresh_inventory(self):
+        files = {"/storage/emulated/0/DCIM/c.jpg": b"c" * 10240}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan, fresh = self._setup(root, files)
+            fresh[0]["mtime"] = 999
+            discrepancies = verify_plan(self.CountingAdb(files), "S", plan, root / "backup", root / "reports", fresh, [])
+        self.assertEqual([d["issue"] for d in discrepancies], ["source_changed_since_inventory"])
+
+    def test_real_adb_class_verify_with_local_shell(self):
+        import shutil
+        import sys
+        sh = shutil.which("sh")
+        if not sh or not shutil.which("sha256sum", path=str(Path(sh).parent)):
+            self.skipTest("no POSIX sh with xargs/sha256sum available")
+        shim = Path(__file__).with_name("fake_adb_shim.py")
+
+        class ShimAdb(Adb):
+            def run(self, args, **kwargs):
+                return super().run([str(shim), *args], **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            src = root / "phone"
+            src.mkdir()
+            files = {}
+            for index, name in enumerate(["a b.jpg", "it's.png", "ümlaut.jpg", "plain.mp4"]):
+                (src / name).write_bytes(bytes([index + 1]) * (30000 + index))
+                files[(src / name).as_posix()] = (src / name).read_bytes()
+            corrupt = {(src / "it's.png").as_posix()}
+            plan, fresh = self._setup(root, files, corrupt=corrupt)
+            discrepancies = verify_plan(ShimAdb(sys.executable), "S", plan, root / "backup", root / "reports", fresh, [])
+        self.assertEqual([(d["source_path"], d["issue"]) for d in discrepancies],
+                         [((src / "it's.png").as_posix(), "content_hash_mismatch")])
+
+
+class KnownScanErrorTests(unittest.TestCase):
+    """Step 4 must not fail on folders Step 1 already recorded as unreadable."""
+
+    LOCKED = "/storage/emulated/0/Android/data/com.yoosee/files/Documents/errorLog"
+
+    def _verify(self, fresh_errors, step1_errors):
+        data = b"k" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "backup" / row["destination_relative_path"]
+            target.parent.mkdir(parents=True)
+            target.write_bytes(data)
+            fresh = [{**row, "size_bytes": len(data), "mtime": 100, "status": "included"}]
+            discrepancies = verify_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports",
+                                        fresh, fresh_errors, known_scan_errors=step1_errors)
+            report = (root / "reports" / "validation_report.md").read_text(encoding="utf-8")
+            with (root / "reports" / "validation_scan_errors.csv").open(encoding="utf-8-sig") as handle:
+                logged = list(csv.DictReader(handle))
+        return discrepancies, report, logged
+
+    def _denied(self, path):
+        return {"path": path, "operation": "scan directory", "error": "Permission denied (skipped)"}
+
+    def test_folder_known_from_step_1_passes_and_is_listed(self):
+        discrepancies, report, logged = self._verify([self._denied(self.LOCKED)], [self._denied(self.LOCKED)])
+        self.assertEqual(discrepancies, [])
+        self.assertIn("Status: **PASS**", report)
+        self.assertIn("not counted): **1**", report)
+        self.assertIn(self.LOCKED, report)
+        self.assertEqual(logged[0]["verification"], "acknowledged in step 1")
+
+    def test_new_denied_folder_still_fails(self):
+        new = "/storage/emulated/0/Android/data/com.other/files"
+        discrepancies, report, logged = self._verify([self._denied(self.LOCKED), self._denied(new)], [self._denied(self.LOCKED)])
+        self.assertEqual([(d["source_path"], d["issue"]) for d in discrepancies], [(new, "source_scan_error")])
+        self.assertIn("Status: **FAIL**", report)
+        self.assertEqual([row["verification"] for row in logged], ["acknowledged in step 1", "new; counted as discrepancy"])
+
+    def test_other_error_on_known_folder_still_fails(self):
+        volume_failure = {"path": self.LOCKED, "operation": "scan volume", "error": "ADB command failed: device offline"}
+        discrepancies, report, _ = self._verify([volume_failure], [self._denied(self.LOCKED)])
+        self.assertEqual([d["issue"] for d in discrepancies], ["source_scan_error"])
+
+    def test_without_step_1_record_everything_counts(self):
+        discrepancies, report, _ = self._verify([self._denied(self.LOCKED)], None)
+        self.assertEqual([d["issue"] for d in discrepancies], ["source_scan_error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
