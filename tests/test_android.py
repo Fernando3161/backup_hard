@@ -54,6 +54,9 @@ class FileAdb:
     def stream(self, serial, source):
         return self.files[source]
 
+    def stream_sha256(self, serial, source):
+        return hashlib.sha256(self.stream(serial, source)).hexdigest()
+
     def sha256_many(self, serial, paths):
         return {path: hashlib.sha256(self.files[path]).hexdigest() for path in paths if path in self.files}
 
@@ -613,8 +616,8 @@ class FastCopyTests(unittest.TestCase):
         shim = Path(__file__).with_name("fake_adb_shim.py")
 
         class ShimAdb(Adb):
-            def run(self, args, **kwargs):
-                return super().run([str(shim), *args], **kwargs)
+            def _argv(self, args):
+                return [self.executable, str(shim), *args]
 
         adb = ShimAdb(sys.executable)
         with tempfile.TemporaryDirectory() as temp:
@@ -721,8 +724,8 @@ class FastVerifyTests(unittest.TestCase):
         shim = Path(__file__).with_name("fake_adb_shim.py")
 
         class ShimAdb(Adb):
-            def run(self, args, **kwargs):
-                return super().run([str(shim), *args], **kwargs)
+            def _argv(self, args):
+                return [self.executable, str(shim), *args]
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -786,6 +789,69 @@ class KnownScanErrorTests(unittest.TestCase):
     def test_without_step_1_record_everything_counts(self):
         discrepancies, report, _ = self._verify([self._denied(self.LOCKED)], None)
         self.assertEqual([d["issue"] for d in discrepancies], ["source_scan_error"])
+
+
+class TemporaryFileAndStreamingTests(unittest.TestCase):
+    def _shim_adb(self):
+        import shutil
+        import sys
+        if not shutil.which("sh"):
+            self.skipTest("no POSIX sh available")
+        shim = Path(__file__).with_name("fake_adb_shim.py")
+
+        class ShimAdb(Adb):
+            def _argv(self, args):
+                return [self.executable, str(shim), *args]
+
+        return ShimAdb(sys.executable)
+
+    def test_temporary_name_is_short_and_independent_of_file_name(self):
+        from backup_hard.android import _temporary_path
+        target = Path("C:/backup/media/whatsapp/images/2026_01") / ("x" * 170 + ".jpg")
+        temporary = _temporary_path(target)
+        self.assertEqual(temporary.parent, target.parent)
+        self.assertLessEqual(len(temporary.name), 25)
+        self.assertNotEqual(temporary, _temporary_path(target))
+
+    def test_leftover_cleanup_removes_only_files_this_tool_created(self):
+        from backup_hard.android import _remove_leftover_temporaries, _temporary_path
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "media" / "camera"
+            folder.mkdir(parents=True)
+            ours = _temporary_path(folder / "a.jpg")
+            legacy = folder / ".a.jpg.backup-hard-0123456789abcdef0123456789abcdef.partial"
+            keep = [folder / "notes.partial", folder / ".bh-not-ours.partial", folder / "a.jpg"]
+            for path in [ours, legacy, *keep]:
+                path.write_bytes(b"x")
+            self.assertEqual(_remove_leftover_temporaries(root), 2)
+            self.assertFalse(ours.exists() or legacy.exists())
+            self.assertTrue(all(path.exists() for path in keep))
+
+    def test_copy_cleans_leftovers_from_an_interrupted_run(self):
+        from backup_hard.android import _temporary_path
+        data = b"r" * 10240
+        row = plan_row(data=data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "backup" / row["destination_relative_path"]
+            target.parent.mkdir(parents=True)
+            stale = _temporary_path(target)
+            stale.write_bytes(b"half")
+            results, _ = copy_plan(FileAdb({row["source_path"]: data}), "S", [row], root / "backup", root / "reports", 1)
+            self.assertEqual(results[0]["status"], "copied")
+            self.assertFalse(stale.exists())
+            self.assertFalse(list((root / "backup").rglob("*.partial")))
+
+    def test_stream_sha256_hashes_in_chunks_through_real_adb_class(self):
+        adb = self._shim_adb()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "big file.bin")
+            data = bytes(range(256)) * 20000  # ~5 MB
+            path.write_bytes(data)
+            self.assertEqual(adb.stream_sha256("S", path.as_posix(), chunk_size=65536), hashlib.sha256(data).hexdigest())
+            with self.assertRaises(AndroidError):
+                adb.stream_sha256("S", Path(temp, "missing.bin").as_posix())
 
 
 if __name__ == "__main__":

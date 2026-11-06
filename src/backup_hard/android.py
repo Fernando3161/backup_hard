@@ -111,11 +111,14 @@ class Adb:
     def __init__(self, executable: str = "adb") -> None:
         self.executable = executable
 
+    def _argv(self, args: Sequence[str]) -> list[str]:
+        return [self.executable, *args]
+
     def run(self, args: Sequence[str], *, binary: bool = False, check: bool = True,
             input: bytes | None = None) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
-                [self.executable, *args], check=check, capture_output=True,
+                self._argv(args), check=check, capture_output=True,
                 text=not binary, encoding=None if binary else "utf-8",
                 errors=None if binary else "replace", shell=False, input=input,
             )
@@ -147,6 +150,22 @@ class Adb:
 
     def stream(self, serial: str, source: str) -> bytes:
         return self.run(["-s", serial, "exec-out", "cat", "--", source], binary=True).stdout
+
+    def stream_sha256(self, serial: str, source: str, chunk_size: int = 1024 * 1024) -> str:
+        """SHA-256 of a device file streamed in chunks, so memory use stays bounded."""
+        digest = hashlib.sha256()
+        try:
+            process = subprocess.Popen(self._argv(["-s", serial, "exec-out", "cat", "--", source]),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        except FileNotFoundError as exc:
+            raise AndroidError("adb was not found. Install Android SDK Platform Tools and add adb to PATH.") from exc
+        with process:
+            for block in iter(lambda: process.stdout.read(chunk_size), b""):
+                digest.update(block)
+            stderr = process.stderr.read()
+            if process.wait():
+                raise AndroidError(f"ADB command failed: {stderr.decode(errors='replace').strip() or 'no diagnostic returned'}")
+        return digest.hexdigest()
 
     def sha256_many(self, serial: str, paths: Sequence[str]) -> dict[str, str]:
         """Hash files on the device in one call; paths go over stdin, never the command line.
@@ -577,7 +596,34 @@ def sha256_file(path: Path) -> str:
 
 
 def sha256_source(adb: Adb, serial: str, path: str) -> str:
-    return hashlib.sha256(adb.stream(serial, path)).hexdigest()
+    return adb.stream_sha256(serial, path)
+
+
+TEMPORARY_PREFIX = ".bh-"
+TEMPORARY_SUFFIX = ".partial"
+
+
+def _temporary_path(target: Path) -> Path:
+    # Short, fixed-length name: never longer than the final path's directory allows.
+    return target.parent / f"{TEMPORARY_PREFIX}{uuid.uuid4().hex[:12]}{TEMPORARY_SUFFIX}"
+
+
+def _remove_leftover_temporaries(destination: Path) -> int:
+    """Delete temporary files an interrupted run left behind (only names this tool creates)."""
+    removed = 0
+    if not destination.exists():
+        return 0
+    for path in destination.rglob(f"*{TEMPORARY_SUFFIX}"):
+        name = path.name
+        owned = (name.startswith(TEMPORARY_PREFIX) and len(name) == len(TEMPORARY_PREFIX) + 12 + len(TEMPORARY_SUFFIX)) \
+            or (name.startswith(".") and ".backup-hard-" in name)
+        if owned and path.is_file():
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def _parse_sha256sum(stdout: bytes, requested: Sequence[str]) -> dict[str, str]:
@@ -628,6 +674,7 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
     if shutil.disk_usage(destination.parent).free < required:
         raise AndroidError(f"Insufficient destination space for {required:,} planned bytes.")
     output.mkdir(parents=True, exist_ok=True)
+    _remove_leftover_temporaries(destination)
     manifest_path = output / "copy_manifest.csv"
     previous = {row["source_path"]: row for row in read_csv(manifest_path)} if manifest_path.exists() else {}
     slots: list[dict[str, object] | None] = [None] * len(plan)
@@ -641,7 +688,7 @@ def copy_plan(adb: Adb, serial: str, plan: list[dict[str, str]], destination: Pa
         for attempt in range(1, retries + 1):
             if stop.is_set():
                 return None
-            partial = target.with_name(f".{target.name}.backup-hard-{uuid.uuid4().hex}.partial")
+            partial = _temporary_path(target)
             try:
                 adb.pull(serial, row["source_path"], partial)
                 if partial.stat().st_size != int(row["size_bytes"]):
